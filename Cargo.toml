@@ -1,11 +1,12 @@
 [package]
-name = "codecrafters-sqlite"
+name = "sqlite-rust"
 version = "0.1.0"
-authors = ["Codecrafters <hello@codecrafters.io>"]
+authors = ["Aaron Ang <aaron.angyd@gmail.com>"]
 edition = "2024"
 rust-version = "1.91"
 
 [dependencies]
-anyhow = "1.0.68"                                # error handling
-bytes = "1.3.0"                                  # helps manage buffers
-thiserror = "1.0.38"                             # error handling
+anyhow = "1.0.102"
+bytes = "1.11.1"
+clap = { version = "4.5.60", features = ["derive", "cargo"] }
+thiserror = "2.0.18"
