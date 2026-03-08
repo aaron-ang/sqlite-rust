@@ -32,6 +32,14 @@ pub enum SqliteParseError {
     InvalidSchemaObjectType(String),
     #[error("invalid sqlite_schema.rootpage value: {0}")]
     InvalidRootPage(i64),
+    #[error("table not found: {0}")]
+    TableNotFound(String),
+    #[error("table {table_name} does not have a root page")]
+    MissingTableRootPage { table_name: String },
+    #[error("page number must be greater than zero")]
+    InvalidPageNumber,
+    #[error("table {table_name} root page has unsupported page type: 0x{page_type:02x}")]
+    UnsupportedTablePageType { table_name: String, page_type: u8 },
     #[error("cell pointer {0} is out of bounds")]
     CellPointerOutOfBounds(usize),
     #[error("cell payload at offset {offset} exceeds page bounds")]

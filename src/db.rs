@@ -1,6 +1,6 @@
 use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -15,6 +15,7 @@ const SQLITE_MAX_PAGE_SIZE_SENTINEL: u16 = 1;
 
 #[derive(Debug)]
 pub struct SqliteDB {
+    path: PathBuf,
     header: DatabaseHeader,
     schema_page: BTreePage,
     schema_table: SchemaTable,
@@ -46,6 +47,7 @@ impl SqliteDB {
         let schema_table = SchemaTable::parse(&page_one, &schema_page)?;
 
         Ok(Self {
+            path: path.to_path_buf(),
             header,
             schema_page,
             schema_table,
@@ -70,6 +72,52 @@ impl SqliteDB {
             .into_iter()
             .map(str::to_owned)
             .collect())
+    }
+
+    pub fn read_page(&self, page_number: u32) -> Result<Vec<u8>> {
+        if page_number == 0 {
+            bail!(SqliteParseError::InvalidPageNumber);
+        }
+
+        let mut file = File::open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        let page_size = self.header.page_size as usize;
+        let file_offset = u64::from(page_number - 1) * u64::from(self.header.page_size);
+
+        file.seek(SeekFrom::Start(file_offset))
+            .with_context(|| format!("failed to seek to page {page_number}"))?;
+
+        let mut page = vec![0_u8; page_size];
+        file.read_exact(&mut page)
+            .with_context(|| format!("failed to read page {page_number}"))?;
+
+        Ok(page)
+    }
+
+    pub fn count_rows(&self, table_name: &str) -> Result<usize> {
+        let entry = self
+            .schema_table
+            .find_table(table_name)
+            .ok_or_else(|| SqliteParseError::TableNotFound(table_name.to_owned()))?;
+        let rootpage = entry
+            .rootpage
+            .ok_or_else(|| SqliteParseError::MissingTableRootPage {
+                table_name: table_name.to_owned(),
+            })?;
+
+        let page = self.read_page(rootpage)?;
+        let header_offset = if rootpage == 1 { SQLITE_HEADER_LEN } else { 0 };
+        let btree_page = BTreePage::parse(&page, header_offset)?;
+
+        if btree_page.kind != BTreePageKind::TableLeaf {
+            let page_type = page.get(header_offset).copied().unwrap_or_default();
+            bail!(SqliteParseError::UnsupportedTablePageType {
+                table_name: table_name.to_owned(),
+                page_type,
+            });
+        }
+
+        Ok(usize::from(btree_page.cell_count))
     }
 }
 
@@ -105,6 +153,10 @@ impl DatabaseHeader {
 mod tests {
     use super::*;
 
+    fn sample_db_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("sample.db")
+    }
+
     #[test]
     fn parses_database_page_size() {
         let mut header = [0_u8; SQLITE_HEADER_LEN];
@@ -137,5 +189,37 @@ mod tests {
 
         assert_eq!(parsed.kind, BTreePageKind::TableLeaf);
         assert_eq!(parsed.cell_count, 3);
+    }
+
+    #[test]
+    fn reads_non_root_page() {
+        let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
+
+        let page = database.read_page(2).expect("page 2 should be readable");
+
+        assert_eq!(page.len(), database.db_info().page_size as usize);
+    }
+
+    #[test]
+    fn finds_apples_rootpage() {
+        let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
+
+        let apples = database
+            .schema_table()
+            .find_table("apples")
+            .expect("apples table should exist");
+
+        assert_eq!(apples.rootpage, Some(2));
+    }
+
+    #[test]
+    fn counts_rows_in_apples_table() {
+        let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
+
+        let row_count = database
+            .count_rows("apples")
+            .expect("apples row count should parse");
+
+        assert_eq!(row_count, 4);
     }
 }

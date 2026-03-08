@@ -47,6 +47,12 @@ impl SchemaTable {
             .map(|entry| entry.table_name.as_str())
             .collect()
     }
+
+    pub fn find_table(&self, name: &str) -> Option<&SchemaTableEntry> {
+        self.entries.iter().find(|entry| {
+            entry.object_type == SchemaObjectType::Table && entry.table_name == name
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
