@@ -10,6 +10,8 @@ use crate::schema_table::SchemaTable;
 
 const SQLITE_HEADER_LEN: usize = 100;
 const SQLITE_MAGIC_HEADER: &[u8; 16] = b"SQLite format 3\0";
+const SQLITE_MAX_PAGE_SIZE: u32 = 65_536;
+const SQLITE_MAX_PAGE_SIZE_SENTINEL: u16 = 1;
 
 #[derive(Debug)]
 pub struct SqliteDB {
@@ -90,7 +92,7 @@ impl DatabaseHeader {
 
         let raw_page_size = u16::from_be_bytes([bytes[16], bytes[17]]);
         let page_size = match raw_page_size {
-            1 => 65_536,
+            SQLITE_MAX_PAGE_SIZE_SENTINEL => SQLITE_MAX_PAGE_SIZE,
             512..=32_768 if raw_page_size.is_power_of_two() => raw_page_size as u32,
             other => bail!(SqliteParseError::InvalidPageSize(other)),
         };
@@ -118,11 +120,11 @@ mod tests {
     fn parses_special_case_page_size_65536() {
         let mut header = [0_u8; SQLITE_HEADER_LEN];
         header[..SQLITE_MAGIC_HEADER.len()].copy_from_slice(SQLITE_MAGIC_HEADER);
-        header[16..18].copy_from_slice(&1_u16.to_be_bytes());
+        header[16..18].copy_from_slice(&SQLITE_MAX_PAGE_SIZE_SENTINEL.to_be_bytes());
 
         let parsed = DatabaseHeader::parse(&header).expect("header should parse");
 
-        assert_eq!(parsed.page_size, 65_536);
+        assert_eq!(parsed.page_size, SQLITE_MAX_PAGE_SIZE);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::str::{self, FromStr};
 
 use anyhow::{Result, bail};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 use strum::EnumString;
 
 use crate::error::SqliteParseError;
@@ -97,26 +98,119 @@ pub enum SchemaObjectType {
     Trigger,
 }
 
-fn parse_record_columns(payload: &[u8]) -> Result<Vec<(u64, &[u8])>> {
-    let header_size_varint = SqliteVarint::parse(payload)?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SerialType {
+    Fixed(FixedSerialType),
+    Blob(usize),
+    Text(usize),
+}
+
+impl SerialType {
+    fn content_size(self) -> usize {
+        match self {
+            Self::Fixed(fixed) => fixed.content_size(),
+            Self::Blob(len) | Self::Text(len) => len,
+        }
+    }
+
+    fn is_text(self) -> bool {
+        matches!(self, Self::Text(_))
+    }
+
+    fn is_integer(self) -> bool {
+        matches!(self, Self::Fixed(fixed) if fixed.is_integer())
+    }
+
+    fn code(self) -> u64 {
+        match self {
+            Self::Fixed(fixed) => fixed.into(),
+            Self::Blob(len) => (len as u64 * 2) + 12,
+            Self::Text(len) => (len as u64 * 2) + 13,
+        }
+    }
+}
+
+impl TryFrom<u64> for SerialType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u64) -> Result<Self> {
+        match value {
+            0..=9 => Ok(Self::Fixed(
+                FixedSerialType::try_from(value)
+                    .map_err(|_| SqliteParseError::UnsupportedSerialType(value))?,
+            )),
+            10 | 11 => bail!(SqliteParseError::UnsupportedSerialType(value)),
+            n if n >= 12 && n % 2 == 0 => Ok(Self::Blob(((n - 12) / 2) as usize)),
+            n if n >= 13 && n % 2 == 1 => Ok(Self::Text(((n - 13) / 2) as usize)),
+            _ => bail!(SqliteParseError::UnsupportedSerialType(value)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
+#[repr(u64)]
+enum FixedSerialType {
+    Null = 0,
+    Int8 = 1,
+    Int16 = 2,
+    Int24 = 3,
+    Int32 = 4,
+    Int48 = 5,
+    Int64 = 6,
+    Float64 = 7,
+    Zero = 8,
+    One = 9,
+}
+
+impl FixedSerialType {
+    fn content_size(self) -> usize {
+        match self {
+            Self::Null | Self::Zero | Self::One => 0,
+            Self::Int8 => 1,
+            Self::Int16 => 2,
+            Self::Int24 => 3,
+            Self::Int32 => 4,
+            Self::Int48 => 6,
+            Self::Int64 | Self::Float64 => 8,
+        }
+    }
+
+    fn is_integer(self) -> bool {
+        matches!(
+            self,
+            Self::Int8
+                | Self::Int16
+                | Self::Int24
+                | Self::Int32
+                | Self::Int48
+                | Self::Int64
+                | Self::Zero
+                | Self::One
+        )
+    }
+}
+
+fn parse_record_columns(payload: &[u8]) -> Result<Vec<(SerialType, &[u8])>> {
+    let mut record_cursor = payload;
+    let header_size_varint = SqliteVarint::parse(&mut record_cursor)?;
     let header_size = usize::try_from(header_size_varint.value())
         .map_err(|_| SqliteParseError::InvalidRecordHeaderSize(header_size_varint.value()))?;
+    let header_prefix_len = payload.len() - record_cursor.len();
 
-    if header_size < header_size_varint.len() || header_size > payload.len() {
+    if header_size < header_prefix_len || header_size > payload.len() {
         bail!(SqliteParseError::InvalidRecordHeaderSize(
             header_size as u64
         ));
     }
 
     let mut serial_types = Vec::with_capacity(SCHEMA_COLUMN_COUNT);
-    let mut header_cursor = header_size_varint.len();
-    while header_cursor < header_size {
-        let serial_type = SqliteVarint::parse(&payload[header_cursor..header_size])?;
-        serial_types.push(serial_type.value());
-        header_cursor += serial_type.len();
+    let mut header_bytes = &payload[header_prefix_len..header_size];
+    while !header_bytes.is_empty() {
+        let serial_type = SqliteVarint::parse(&mut header_bytes)?;
+        serial_types.push(SerialType::try_from(serial_type.value())?);
     }
 
-    if header_cursor != header_size || serial_types.len() != SCHEMA_COLUMN_COUNT {
+    if serial_types.len() != SCHEMA_COLUMN_COUNT {
         bail!(SqliteParseError::InvalidRecordHeaderSize(
             header_size as u64
         ));
@@ -125,7 +219,7 @@ fn parse_record_columns(payload: &[u8]) -> Result<Vec<(u64, &[u8])>> {
     let mut body_cursor = header_size;
     let mut columns = Vec::with_capacity(SCHEMA_COLUMN_COUNT);
     for serial_type in serial_types {
-        let value_size = serial_type_content_size(serial_type)?;
+        let value_size = serial_type.content_size();
         let value_end = body_cursor.checked_add(value_size).ok_or(
             SqliteParseError::CellPayloadOutOfBounds {
                 offset: body_cursor,
@@ -143,31 +237,15 @@ fn parse_record_columns(payload: &[u8]) -> Result<Vec<(u64, &[u8])>> {
     Ok(columns)
 }
 
-fn serial_type_content_size(serial_type: u64) -> Result<usize> {
-    let size = match serial_type {
-        0 => 0,
-        1 => 1,
-        2 => 2,
-        3 => 3,
-        4 => 4,
-        5 => 6,
-        6 => 8,
-        7 => 8,
-        8 => 0,
-        9 => 0,
-        10 | 11 => bail!(SqliteParseError::UnsupportedSerialType(serial_type)),
-        n if n >= 12 => ((n - 12) / 2) as usize,
-        _ => bail!(SqliteParseError::UnsupportedSerialType(serial_type)),
-    };
-
-    Ok(size)
-}
-
-fn decode_required_text(column: &'static str, serial_type: u64, value: &[u8]) -> Result<String> {
-    if serial_type < 13 || serial_type % 2 == 0 {
+fn decode_required_text(
+    column: &'static str,
+    serial_type: SerialType,
+    value: &[u8],
+) -> Result<String> {
+    if !serial_type.is_text() {
         bail!(SqliteParseError::UnexpectedTextSerialType {
             column,
-            serial_type,
+            serial_type: serial_type.code(),
         });
     }
 
@@ -177,26 +255,28 @@ fn decode_required_text(column: &'static str, serial_type: u64, value: &[u8]) ->
 
 fn decode_nullable_text(
     column: &'static str,
-    serial_type: u64,
+    serial_type: SerialType,
     value: &[u8],
 ) -> Result<Option<String>> {
-    if serial_type == 0 {
+    if serial_type == SerialType::Fixed(FixedSerialType::Null) {
         return Ok(None);
     }
 
     Ok(Some(decode_required_text(column, serial_type, value)?))
 }
 
-fn decode_rootpage(serial_type: u64, value: &[u8]) -> Result<Option<u32>> {
+fn decode_rootpage(serial_type: SerialType, value: &[u8]) -> Result<Option<u32>> {
     let integer = match serial_type {
-        0 => return Ok(None),
-        1..=6 => decode_signed_integer(value),
-        8 => 0,
-        9 => 1,
+        SerialType::Fixed(FixedSerialType::Null) => return Ok(None),
+        serial_type if serial_type.is_integer() => match serial_type {
+            SerialType::Fixed(FixedSerialType::Zero) => 0,
+            SerialType::Fixed(FixedSerialType::One) => 1,
+            _ => decode_signed_integer(value),
+        },
         _ => {
             bail!(SqliteParseError::UnexpectedIntegerSerialType {
                 column: "rootpage",
-                serial_type,
+                serial_type: serial_type.code(),
             });
         }
     };
