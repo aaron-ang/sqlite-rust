@@ -20,6 +20,8 @@ pub enum SqliteParseError {
     UnexpectedTextSerialType { column: String, serial_type: u64 },
     #[error("expected integer serial type for {column}, found {serial_type}")]
     UnexpectedIntegerSerialType { column: String, serial_type: u64 },
+    #[error("unsupported output serial type for {column}: {serial_type}")]
+    UnsupportedOutputSerialType { column: String, serial_type: u64 },
     #[error("invalid UTF-8 in {column}")]
     InvalidUtf8 { column: String },
     #[error("invalid sqlite_schema.type value: {0}")]

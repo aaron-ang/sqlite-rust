@@ -5,15 +5,76 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::error::SqliteParseError;
-use crate::page::{BTreeCell, BTreePage, BTreePageKind};
+use crate::page::{BTreePage, BTreePageKind};
 use crate::query::WhereClause;
 use crate::record::Record;
-use crate::schema_table::{SchemaTable, SchemaTableEntry};
+use crate::schema::{SchemaTable, SchemaTableEntry};
+use crate::table::TableScanner;
 
 const SQLITE_HEADER_LEN: usize = 100;
 const SQLITE_MAGIC_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_MAX_PAGE_SIZE: u32 = 65_536;
 const SQLITE_MAX_PAGE_SIZE_SENTINEL: u16 = 1;
+
+#[derive(Clone, Debug)]
+enum ResolvedColumn {
+    RowIdAlias,
+    RecordColumn { column_name: String, index: usize },
+}
+
+impl ResolvedColumn {
+    fn resolve(entry: &SchemaTableEntry, column_name: &str) -> Result<Self> {
+        let rowid_alias = entry.rowid_alias_column_name()?;
+        if rowid_alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case(column_name))
+        {
+            return Ok(Self::RowIdAlias);
+        }
+
+        Ok(Self::RecordColumn {
+            column_name: column_name.to_owned(),
+            index: entry.column_index(column_name)?,
+        })
+    }
+
+    fn decode_output(&self, table_name: &str, rowid: u64, record: &Record<'_>) -> Result<String> {
+        match self {
+            Self::RowIdAlias => Ok(rowid.to_string()),
+            Self::RecordColumn { column_name, index } => {
+                let column =
+                    record
+                        .column(*index)
+                        .ok_or(SqliteParseError::RecordColumnOutOfBounds {
+                            column_index: *index,
+                        })?;
+                column.decode_output_value(format!("{table_name}.{column_name}"))
+            }
+        }
+    }
+
+    fn matches_text_literal(
+        &self,
+        table_name: &str,
+        rowid: u64,
+        record: &Record<'_>,
+        expected: &str,
+    ) -> Result<bool> {
+        match self {
+            Self::RowIdAlias => Ok(rowid.to_string() == expected),
+            Self::RecordColumn { column_name, index } => {
+                let column =
+                    record
+                        .column(*index)
+                        .ok_or(SqliteParseError::RecordColumnOutOfBounds {
+                            column_index: *index,
+                        })?;
+                let actual = column.decode_nullable_text(format!("{table_name}.{column_name}"))?;
+                Ok(actual.as_deref() == Some(expected))
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct SqliteDB {
@@ -88,8 +149,14 @@ impl SqliteDB {
     }
 
     pub fn count_rows(&self, table_name: &str) -> Result<usize> {
-        let (_, _page, btree_page) = self.read_table_root_page(table_name)?;
-        Ok(usize::from(btree_page.cell_count))
+        let (_, rootpage) = self.resolve_table_root(table_name)?;
+        let scanner = TableScanner::new(self);
+        let mut count = 0;
+        scanner.visit_records(table_name, rootpage, |_, _| {
+            count += 1;
+            Ok(())
+        })?;
+        Ok(count)
     }
 
     pub fn select_rows(
@@ -98,65 +165,56 @@ impl SqliteDB {
         column_names: &[String],
         where_clause: Option<&WhereClause>,
     ) -> Result<Vec<String>> {
-        let (entry, page, btree_page) = self.read_table_root_page(table_name)?;
-        let column_indices = column_names
+        let (entry, rootpage) = self.resolve_table_root(table_name)?;
+        let resolved_columns = column_names
             .iter()
-            .map(|column_name| entry.column_index(column_name))
+            .map(|column_name| ResolvedColumn::resolve(&entry, column_name))
             .collect::<Result<Vec<_>>>()?;
         let predicate = match where_clause {
-            Some(WhereClause::EqualsText { column_name, value }) => Some((
-                entry.column_index(column_name)?,
-                column_name.clone(),
-                value.clone(),
-            )),
+            Some(WhereClause::EqualsText { column_name, value }) => {
+                Some((ResolvedColumn::resolve(&entry, column_name)?, value.clone()))
+            }
             None => None,
         };
+        let scanner = TableScanner::new(self);
+        let mut rows = Vec::new();
 
-        let rows = btree_page
-            .cells(&page)?
-            .into_iter()
-            .map(|cell| match cell {
-                BTreeCell::TableLeaf(cell) => {
-                    let record = Record::parse(cell.payload)?;
-                    if let Some((predicate_index, predicate_column_name, predicate_value)) =
-                        predicate.as_ref()
-                    {
-                        let predicate_column = record.column(*predicate_index).ok_or(
-                            SqliteParseError::RecordColumnOutOfBounds {
-                                column_index: *predicate_index,
-                            },
-                        )?;
-                        let actual_value = predicate_column
-                            .decode_text(format!("{table_name}.{predicate_column_name}"))?;
-                        if actual_value != *predicate_value {
-                            return Ok(None);
-                        }
-                    }
-
-                    let values = column_names
-                        .iter()
-                        .zip(&column_indices)
-                        .map(|(column_name, &column_index)| {
-                            let column = record.column(column_index).ok_or(
-                                SqliteParseError::RecordColumnOutOfBounds { column_index },
-                            )?;
-                            column.decode_text(format!("{table_name}.{column_name}"))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-
-                    Ok(Some(values.join("|")))
+        scanner.visit_records(table_name, rootpage, |rowid, record| {
+            if let Some((predicate_column, predicate_value)) = predicate.as_ref() {
+                if !predicate_column.matches_text_literal(
+                    table_name,
+                    rowid,
+                    &record,
+                    predicate_value,
+                )? {
+                    return Ok(());
                 }
-                _ => unreachable!("table root page must be a table leaf page"),
-            })
-            .collect::<Result<Vec<_>>>()?;
+            }
 
-        Ok(rows.into_iter().flatten().collect())
+            let values = resolved_columns
+                .iter()
+                .map(|column| column.decode_output(table_name, rowid, &record))
+                .collect::<Result<Vec<_>>>()?;
+
+            rows.push(values.join("|"));
+            Ok(())
+        })?;
+
+        Ok(rows)
     }
 
-    fn read_table_root_page(
-        &self,
-        table_name: &str,
-    ) -> Result<(SchemaTableEntry, Vec<u8>, BTreePage)> {
+    pub(crate) fn read_btree_page(&self, page_number: u32) -> Result<(Vec<u8>, BTreePage)> {
+        let page = self.read_page(page_number)?;
+        let header_offset = if page_number == 1 {
+            SQLITE_HEADER_LEN
+        } else {
+            0
+        };
+        let btree_page = BTreePage::parse(&page, header_offset)?;
+        Ok((page, btree_page))
+    }
+
+    fn resolve_table_root(&self, table_name: &str) -> Result<(SchemaTableEntry, u32)> {
         let entry = self
             .schema_table
             .find_table(table_name)
@@ -168,19 +226,7 @@ impl SqliteDB {
                 table_name: table_name.to_owned(),
             })?;
 
-        let page = self.read_page(rootpage)?;
-        let header_offset = if rootpage == 1 { SQLITE_HEADER_LEN } else { 0 };
-        let btree_page = BTreePage::parse(&page, header_offset)?;
-
-        if btree_page.kind != BTreePageKind::TableLeaf {
-            let page_type = page.get(header_offset).copied().unwrap_or_default();
-            bail!(SqliteParseError::UnsupportedTablePageType {
-                table_name: table_name.to_owned(),
-                page_type,
-            });
-        }
-
-        Ok((entry, page, btree_page))
+        Ok((entry, rootpage))
     }
 }
 
@@ -217,7 +263,11 @@ mod tests {
     use super::*;
 
     fn sample_db_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("sample.db")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("sample_clone.db")
+    }
+
+    fn superheroes_db_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("superheroes.db")
     }
 
     #[test]
@@ -466,5 +516,63 @@ mod tests {
                 column_name,
             } if table_name == "apples" && column_name == "missing_col"
         ));
+    }
+
+    #[test]
+    fn superheroes_root_page_is_table_interior() {
+        let database = SqliteDB::open(&superheroes_db_path()).expect("superheroes db should open");
+
+        let superheroes = database
+            .schema_table
+            .find_table("superheroes")
+            .expect("superheroes table should exist");
+        let rootpage = superheroes
+            .rootpage
+            .expect("superheroes should have root page");
+        let (_, btree_page) = database
+            .read_btree_page(rootpage)
+            .expect("superheroes root page should be readable");
+
+        assert_eq!(btree_page.kind, BTreePageKind::TableInterior);
+    }
+
+    #[test]
+    fn counts_rows_in_superheroes_table() {
+        let database = SqliteDB::open(&superheroes_db_path()).expect("superheroes db should open");
+
+        let row_count = database
+            .count_rows("superheroes")
+            .expect("superheroes row count should parse");
+
+        assert_eq!(row_count, 6_895);
+    }
+
+    #[test]
+    fn selects_filtered_rows_from_multi_page_superheroes_table() {
+        let database = SqliteDB::open(&superheroes_db_path()).expect("superheroes db should open");
+
+        let mut rows = database
+            .select_rows(
+                "superheroes",
+                &["id".to_owned(), "name".to_owned()],
+                Some(&WhereClause::EqualsText {
+                    column_name: "eye_color".to_owned(),
+                    value: "Pink Eyes".to_owned(),
+                }),
+            )
+            .expect("filtered superheroes rows should parse");
+        rows.sort();
+
+        assert_eq!(
+            rows,
+            vec![
+                "1085|Felicity (New Earth)".to_owned(),
+                "2729|Thrust (New Earth)".to_owned(),
+                "297|Stealth (New Earth)".to_owned(),
+                "3289|Angora Lapin (New Earth)".to_owned(),
+                "3913|Matris Ater Clementia (New Earth)".to_owned(),
+                "790|Tobias Whale (New Earth)".to_owned(),
+            ]
+        );
     }
 }

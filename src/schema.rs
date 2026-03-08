@@ -1,11 +1,15 @@
 use std::str::FromStr;
 
 use anyhow::{Result, bail};
-use sqlparser::{ast::Statement, dialect::SQLiteDialect, parser::Parser};
+use sqlparser::{
+    ast::{ColumnOption, DataType, Statement},
+    dialect::SQLiteDialect,
+    parser::Parser,
+};
 use strum::EnumString;
 
 use crate::error::SqliteParseError;
-use crate::page::{BTreeCell, BTreePage, BTreePageKind, TableLeafCell};
+use crate::page::{BTreeCell, BTreePage, BTreePageKind};
 use crate::record::Record;
 
 const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
@@ -28,7 +32,7 @@ impl SchemaTable {
             .cells(page)?
             .into_iter()
             .map(|cell| match cell {
-                BTreeCell::TableLeaf(cell) => SchemaTableEntry::parse_from_table_leaf_cell(cell),
+                BTreeCell::TableLeaf(cell) => SchemaTableEntry::parse_record(cell.payload),
                 _ => unreachable!("schema table must be stored on a table leaf b-tree page"),
             })
             .collect::<Result<Vec<_>>>()?;
@@ -72,6 +76,41 @@ impl SchemaTableEntry {
     }
 
     pub fn column_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .parse_create_table()?
+            .columns
+            .into_iter()
+            .map(|column| column.name.value)
+            .collect())
+    }
+
+    pub fn rowid_alias_column_name(&self) -> Result<Option<String>> {
+        Ok(self
+            .parse_create_table()?
+            .columns
+            .into_iter()
+            .find(|column| {
+                matches!(column.data_type, DataType::Integer(_))
+                    && column
+                        .options
+                        .iter()
+                        .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
+            })
+            .map(|column| column.name.value))
+    }
+
+    pub fn column_index(&self, column_name: &str) -> Result<usize> {
+        self.column_names()?
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(column_name))
+            .ok_or_else(|| SqliteParseError::ColumnNotFound {
+                table_name: self.table_name.clone(),
+                column_name: column_name.to_owned(),
+            })
+            .map_err(Into::into)
+    }
+
+    fn parse_create_table(&self) -> Result<sqlparser::ast::CreateTable> {
         let sql = self
             .sql
             .as_ref()
@@ -99,26 +138,7 @@ impl SchemaTableEntry {
             });
         };
 
-        Ok(create_table
-            .columns
-            .into_iter()
-            .map(|column| column.name.value)
-            .collect())
-    }
-
-    pub fn column_index(&self, column_name: &str) -> Result<usize> {
-        self.column_names()?
-            .iter()
-            .position(|name| name.eq_ignore_ascii_case(column_name))
-            .ok_or_else(|| SqliteParseError::ColumnNotFound {
-                table_name: self.table_name.clone(),
-                column_name: column_name.to_owned(),
-            })
-            .map_err(Into::into)
-    }
-
-    fn parse_from_table_leaf_cell(cell: TableLeafCell<'_>) -> Result<Self> {
-        Self::parse_record(cell.payload)
+        Ok(create_table)
     }
 
     fn parse_record(payload: &[u8]) -> Result<Self> {
@@ -185,5 +205,9 @@ mod tests {
             vec!["id".to_owned(), "name".to_owned(), "color".to_owned()]
         );
         assert_eq!(entry.column_index("name").unwrap(), 1);
+        assert_eq!(
+            entry.rowid_alias_column_name().unwrap(),
+            Some("id".to_owned())
+        );
     }
 }

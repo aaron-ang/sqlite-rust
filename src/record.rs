@@ -95,6 +95,30 @@ impl<'a> RecordColumn<'a> {
         self.decode_text(column).map(Some)
     }
 
+    pub fn decode_output_value(self, column: impl Into<String>) -> Result<String> {
+        let column = column.into();
+
+        if self.serial_type.is_null() {
+            return Ok(String::new());
+        }
+
+        if self.serial_type.is_text() {
+            return self.decode_text(column);
+        }
+
+        if self.serial_type.is_integer() {
+            let value = self
+                .decode_optional_integer(column)?
+                .expect("non-null integer serial type should decode to a value");
+            return Ok(value.to_string());
+        }
+
+        bail!(SqliteParseError::UnsupportedOutputSerialType {
+            column,
+            serial_type: self.serial_type.code(),
+        })
+    }
+
     pub fn decode_optional_integer(self, column: impl Into<String>) -> Result<Option<i64>> {
         let column = column.into();
         match self.serial_type {
@@ -226,8 +250,8 @@ mod tests {
     use super::*;
 
     fn build_record_payload() -> Vec<u8> {
-        let mut payload = vec![4, 0, 23, 15];
-        payload.extend_from_slice(b"applex");
+        let mut payload = vec![4, 0, 23, 9];
+        payload.extend_from_slice(b"apple");
         payload
     }
 
@@ -257,5 +281,13 @@ mod tests {
             None
         );
         assert_eq!(record.column(1).unwrap().serial_type, SerialType::Text(5));
+    }
+
+    #[test]
+    fn decodes_integer_output_value() {
+        let payload = build_record_payload();
+        let record = Record::parse(&payload).expect("record should parse");
+
+        assert_eq!(record.column(2).unwrap().decode_output_value("flag").unwrap(), "1");
     }
 }

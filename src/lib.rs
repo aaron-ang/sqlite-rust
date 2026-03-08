@@ -4,5 +4,6 @@ pub mod error;
 pub mod page;
 pub mod query;
 pub mod record;
-pub mod schema_table;
+pub mod schema;
+pub mod table;
 pub mod varint;
