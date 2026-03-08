@@ -17,14 +17,14 @@ const SQLITE_MAGIC_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_MAX_PAGE_SIZE: u32 = 65_536;
 const SQLITE_MAX_PAGE_SIZE_SENTINEL: u16 = 1;
 
-#[derive(Clone, Debug)]
-enum ResolvedColumn {
+#[derive(Clone, Copy, Debug)]
+enum ResolvedColumn<'a> {
     RowIdAlias,
-    RecordColumn { column_name: String, index: usize },
+    RecordColumn { column_name: &'a str, index: usize },
 }
 
-impl ResolvedColumn {
-    fn resolve(entry: &SchemaTableEntry, column_name: &str) -> Result<Self> {
+impl<'a> ResolvedColumn<'a> {
+    fn resolve(entry: &SchemaTableEntry, column_name: &'a str) -> Result<Self> {
         let rowid_alias = entry.rowid_alias_column_name()?;
         if rowid_alias
             .as_deref()
@@ -34,12 +34,12 @@ impl ResolvedColumn {
         }
 
         Ok(Self::RecordColumn {
-            column_name: column_name.to_owned(),
+            column_name,
             index: entry.column_index(column_name)?,
         })
     }
 
-    fn decode_output(&self, table_name: &str, rowid: u64, record: &Record<'_>) -> Result<String> {
+    fn decode_output(&self, table_name: &str, rowid: u64, record: &Record) -> Result<String> {
         match self {
             Self::RowIdAlias => Ok(rowid.to_string()),
             Self::RecordColumn { column_name, index } => {
@@ -58,7 +58,7 @@ impl ResolvedColumn {
         &self,
         table_name: &str,
         rowid: u64,
-        record: &Record<'_>,
+        record: &Record,
         expected: &str,
     ) -> Result<bool> {
         match self {
@@ -71,7 +71,7 @@ impl ResolvedColumn {
                             column_index: *index,
                         })?;
                 let actual = column.decode_nullable_text(format!("{table_name}.{column_name}"))?;
-                Ok(actual.as_deref() == Some(expected))
+                Ok(actual == Some(expected))
             }
         }
     }
@@ -167,8 +167,8 @@ impl SqliteDB {
         where_clause: Option<&WhereClause>,
     ) -> Result<Vec<String>> {
         let (entry, rootpage) = self.resolve_table_root(table_name)?;
-        let resolved_columns = Self::resolve_columns(&entry, column_names)?;
-        let predicate = Self::resolve_predicate(&entry, where_clause)?;
+        let resolved_columns = Self::resolve_columns(entry, column_names)?;
+        let predicate = Self::resolve_predicate(entry, where_clause)?;
 
         if let Some(WhereClause::EqualsText { column_name, value }) = where_clause
             && let Some(index_entry) = self
@@ -184,15 +184,15 @@ impl SqliteDB {
             );
         }
 
-        self.select_rows_via_table_scan(table_name, rootpage, &resolved_columns, predicate.as_ref())
+        self.select_rows_via_table_scan(table_name, rootpage, &resolved_columns, predicate)
     }
 
-    fn select_rows_via_table_scan(
+    fn select_rows_via_table_scan<'a>(
         &self,
         table_name: &str,
         rootpage: u32,
-        resolved_columns: &[ResolvedColumn],
-        predicate: Option<&(ResolvedColumn, String)>,
+        resolved_columns: &[ResolvedColumn<'a>],
+        predicate: Option<(ResolvedColumn<'a>, &'a str)>,
     ) -> Result<Vec<String>> {
         let scanner = TableScanner::new(self);
         let mut rows = Vec::new();
@@ -238,26 +238,30 @@ impl SqliteDB {
                 })?;
         let index_scanner = IndexScanner::new(self);
         let table_scanner = TableScanner::new(self);
-        let rowids = index_scanner.find_matching_rowids(
+        let mut rows = Vec::new();
+
+        index_scanner.visit_matching_rowids(
             &index_entry.name,
             index_rootpage,
             predicate_value,
-        )?;
-        let mut rows = Vec::with_capacity(rowids.len());
-
-        for rowid in rowids {
-            if let Some(row) =
-                table_scanner.find_record_by_rowid(table_name, table_rootpage, rowid)?
-            {
-                let record = Record::parse(&row.payload)?;
-                rows.push(Self::project_row(
+            |rowid| {
+                table_scanner.with_record_by_rowid(
                     table_name,
-                    row.rowid,
-                    &record,
-                    resolved_columns,
-                )?);
-            }
-        }
+                    table_rootpage,
+                    rowid,
+                    |rowid, record| {
+                        rows.push(Self::project_row(
+                            table_name,
+                            rowid,
+                            &record,
+                            resolved_columns,
+                        )?);
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            },
+        )?;
 
         Ok(rows)
     }
@@ -265,7 +269,7 @@ impl SqliteDB {
     fn project_row(
         table_name: &str,
         rowid: u64,
-        record: &Record<'_>,
+        record: &Record,
         resolved_columns: &[ResolvedColumn],
     ) -> Result<String> {
         Ok(resolved_columns
@@ -275,25 +279,24 @@ impl SqliteDB {
             .join("|"))
     }
 
-    fn resolve_columns(
+    fn resolve_columns<'a>(
         entry: &SchemaTableEntry,
-        column_names: &[String],
-    ) -> Result<Vec<ResolvedColumn>> {
+        column_names: &'a [String],
+    ) -> Result<Vec<ResolvedColumn<'a>>> {
         column_names
             .iter()
             .map(|column_name| ResolvedColumn::resolve(entry, column_name))
             .collect()
     }
 
-    fn resolve_predicate(
+    fn resolve_predicate<'a>(
         entry: &SchemaTableEntry,
-        where_clause: Option<&WhereClause>,
-    ) -> Result<Option<(ResolvedColumn, String)>> {
+        where_clause: Option<&'a WhereClause>,
+    ) -> Result<Option<(ResolvedColumn<'a>, &'a str)>> {
         match where_clause {
-            Some(WhereClause::EqualsText { column_name, value }) => Ok(Some((
-                ResolvedColumn::resolve(entry, column_name)?,
-                value.clone(),
-            ))),
+            Some(WhereClause::EqualsText { column_name, value }) => {
+                Ok(Some((ResolvedColumn::resolve(entry, column_name)?, value)))
+            }
             None => Ok(None),
         }
     }
@@ -309,11 +312,10 @@ impl SqliteDB {
         Ok((page, btree_page))
     }
 
-    fn resolve_table_root(&self, table_name: &str) -> Result<(SchemaTableEntry, u32)> {
+    fn resolve_table_root(&self, table_name: &str) -> Result<(&SchemaTableEntry, u32)> {
         let entry = self
             .schema_table
             .find_table(table_name)
-            .cloned()
             .ok_or_else(|| SqliteParseError::TableNotFound(table_name.to_owned()))?;
         let rootpage = entry
             .rootpage
@@ -713,20 +715,24 @@ mod tests {
             .expect("companies table should exist");
         let rootpage = companies.rootpage.expect("companies should have root page");
         let scanner = TableScanner::new(&database);
-        let row = scanner
-            .find_record_by_rowid("companies", rootpage, 121_311)
-            .expect("row lookup should succeed")
-            .expect("company row should exist");
-        let record = Record::parse(&row.payload).expect("company record should parse");
+        let mut company_name = None;
 
-        assert_eq!(
-            record
-                .column(companies.column_index("name").unwrap())
-                .unwrap()
-                .decode_text("companies.name")
-                .unwrap(),
-            "unilink s.c."
-        );
+        let found = scanner
+            .with_record_by_rowid("companies", rootpage, 121_311, |_, record| {
+                company_name = Some(
+                    record
+                        .column(companies.column_index("name").unwrap())
+                        .unwrap()
+                        .decode_text("companies.name")
+                        .unwrap()
+                        .to_owned(),
+                );
+                Ok(())
+            })
+            .expect("row lookup should succeed");
+
+        assert!(found);
+        assert_eq!(company_name.as_deref(), Some("unilink s.c."));
     }
 
     #[test]

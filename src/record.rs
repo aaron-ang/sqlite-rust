@@ -73,7 +73,7 @@ impl<'a> RecordColumn<'a> {
         self.value
     }
 
-    pub fn decode_text(self, column: impl Into<String>) -> Result<String> {
+    pub fn decode_text(self, column: impl Into<String>) -> Result<&'a str> {
         let column = column.into();
         if !self.serial_type.is_text() {
             bail!(SqliteParseError::UnexpectedSerialType {
@@ -83,12 +83,10 @@ impl<'a> RecordColumn<'a> {
             });
         }
 
-        let text =
-            str::from_utf8(self.value).map_err(|_| SqliteParseError::InvalidUtf8 { column })?;
-        Ok(text.to_owned())
+        str::from_utf8(self.value).map_err(|_| SqliteParseError::InvalidUtf8 { column }.into())
     }
 
-    pub fn decode_nullable_text(self, column: impl Into<String>) -> Result<Option<String>> {
+    pub fn decode_nullable_text(self, column: impl Into<String>) -> Result<Option<&'a str>> {
         if self.serial_type.is_null() {
             return Ok(None);
         }
@@ -104,7 +102,7 @@ impl<'a> RecordColumn<'a> {
         }
 
         if self.serial_type.is_text() {
-            return self.decode_text(column);
+            return Ok(self.decode_text(column)?.to_owned());
         }
 
         if self.serial_type.is_integer() {
@@ -291,6 +289,13 @@ mod tests {
         let payload = build_record_payload();
         let record = Record::parse(&payload).expect("record should parse");
 
-        assert_eq!(record.column(2).unwrap().decode_output_value("flag").unwrap(), "1");
+        assert_eq!(
+            record
+                .column(2)
+                .unwrap()
+                .decode_optional_integer("flag")
+                .unwrap(),
+            Some(1)
+        );
     }
 }

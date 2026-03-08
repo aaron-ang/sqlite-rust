@@ -5,12 +5,6 @@ use crate::error::SqliteParseError;
 use crate::page::{BTreeCell, BTreePageKind};
 use crate::record::Record;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct TableRow {
-    pub rowid: u64,
-    pub payload: Vec<u8>,
-}
-
 pub struct TableScanner<'a> {
     db: &'a SqliteDB,
 }
@@ -69,12 +63,16 @@ impl<'a> TableScanner<'a> {
         Ok(())
     }
 
-    pub fn find_record_by_rowid(
+    pub fn with_record_by_rowid<F>(
         &self,
         table_name: &str,
         root_page: u32,
         target_rowid: u64,
-    ) -> Result<Option<TableRow>> {
+        mut visitor: F,
+    ) -> Result<bool>
+    where
+        F: for<'record> FnMut(u64, Record<'record>) -> Result<()>,
+    {
         let mut current_page = root_page;
 
         loop {
@@ -87,14 +85,12 @@ impl<'a> TableScanner<'a> {
                             unreachable!("table leaf page should only contain table leaf cells");
                         };
                         if cell.rowid.value() == target_rowid {
-                            return Ok(Some(TableRow {
-                                rowid: target_rowid,
-                                payload: cell.payload.to_vec(),
-                            }));
+                            visitor(target_rowid, Record::parse(cell.payload)?)?;
+                            return Ok(true);
                         }
                     }
 
-                    return Ok(None);
+                    return Ok(false);
                 }
                 BTreePageKind::TableInterior => {
                     let mut next_page = btree_page.right_most_ptr.ok_or(

@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use anyhow::{Result, bail};
 
 use crate::db::SqliteDB;
@@ -5,10 +7,61 @@ use crate::error::SqliteParseError;
 use crate::page::{BTreeCell, BTreePageKind};
 use crate::record::Record;
 
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
-struct IndexKey {
-    indexed_value: Option<String>,
+#[derive(Clone, Copy, Debug)]
+struct IndexKey<'a> {
+    indexed_value: Option<&'a str>,
     rowid: u64,
+}
+
+impl<'a> IndexKey<'a> {
+    fn cmp_index_value(&self, target: &str) -> Ordering {
+        match self.indexed_value {
+            Some(value) => value.cmp(target),
+            None => Ordering::Less,
+        }
+    }
+
+    fn cmp_lower_probe(&self, target: &str) -> Ordering {
+        self.cmp_index_value(target)
+            .then_with(|| self.rowid.cmp(&u64::MAX))
+    }
+
+    fn cmp_upper_probe(&self, target: &str) -> Ordering {
+        self.cmp_index_value(target)
+            .then_with(|| self.rowid.cmp(&0))
+    }
+}
+
+#[derive(Debug)]
+struct ChildRange<'a> {
+    lower_exclusive: Option<IndexKey<'a>>,
+    upper_exclusive: Option<IndexKey<'a>>,
+}
+
+impl<'a> ChildRange<'a> {
+    fn between(lower_exclusive: Option<IndexKey<'a>>, upper_exclusive: IndexKey<'a>) -> Self {
+        Self {
+            lower_exclusive,
+            upper_exclusive: Some(upper_exclusive),
+        }
+    }
+
+    fn right_of(lower_exclusive: Option<IndexKey<'a>>) -> Self {
+        Self {
+            lower_exclusive,
+            upper_exclusive: None,
+        }
+    }
+
+    fn contains(&self, target: &str) -> bool {
+        let upper_overlaps = self
+            .upper_exclusive
+            .is_none_or(|upper| upper.cmp_upper_probe(target) == Ordering::Greater);
+        let lower_overlaps = self
+            .lower_exclusive
+            .is_none_or(|lower| lower.cmp_lower_probe(target) == Ordering::Less);
+        upper_overlaps && lower_overlaps
+    }
 }
 
 pub struct IndexScanner<'a> {
@@ -20,21 +73,16 @@ impl<'a> IndexScanner<'a> {
         Self { db }
     }
 
-    pub fn find_matching_rowids(
+    pub fn visit_matching_rowids<F>(
         &self,
         index_name: &str,
         root_page: u32,
         target: &str,
-    ) -> Result<Vec<u64>> {
-        let lower_bound = IndexKey {
-            indexed_value: Some(target.to_owned()),
-            rowid: 0,
-        };
-        let upper_bound = IndexKey {
-            indexed_value: Some(target.to_owned()),
-            rowid: u64::MAX,
-        };
-        let mut rowids = Vec::new();
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64) -> Result<()>,
+    {
         let mut pages_to_visit = vec![root_page];
 
         while let Some(page_number) = pages_to_visit.pop() {
@@ -42,52 +90,49 @@ impl<'a> IndexScanner<'a> {
 
             match btree_page.kind {
                 BTreePageKind::IndexLeaf => {
-                    for cell in btree_page.cells(&page_bytes)? {
-                        let BTreeCell::IndexLeaf(cell) = cell else {
-                            unreachable!("index leaf page should only contain index leaf cells");
-                        };
-                        let index_key = parse_index_key(cell.payload, index_name)?;
-                        if index_key.indexed_value.as_deref() == Some(target) {
-                            rowids.push(index_key.rowid);
-                        }
-                    }
+                    btree_page
+                        .cells(&page_bytes)?
+                        .into_iter()
+                        .try_for_each(|cell| {
+                            let BTreeCell::IndexLeaf(cell) = cell else {
+                                unreachable!(
+                                    "index leaf page should only contain index leaf cells"
+                                );
+                            };
+                            let key = parse_index_key(cell.payload, index_name)?;
+                            if key.indexed_value == Some(target) {
+                                visitor(key.rowid)?;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        })?;
                 }
                 BTreePageKind::IndexInterior => {
-                    let cells = btree_page.cells(&page_bytes)?;
-                    let mut child_ranges = Vec::with_capacity(cells.len() + 1);
                     let mut lower_exclusive: Option<IndexKey> = None;
 
-                    for cell in cells {
-                        let BTreeCell::IndexInterior(cell) = cell else {
-                            unreachable!(
-                                "index interior page should only contain index interior cells"
-                            );
-                        };
-                        let key = parse_index_key(cell.payload, index_name)?;
-                        if key.indexed_value.as_deref() == Some(target) {
-                            rowids.push(key.rowid);
-                        }
-                        child_ranges.push((
-                            cell.left_child_ptr,
-                            lower_exclusive.clone(),
-                            Some(key.clone()),
-                        ));
-                        lower_exclusive = Some(key);
-                    }
+                    btree_page
+                        .cells(&page_bytes)?
+                        .into_iter()
+                        .try_for_each(|cell| {
+                            let BTreeCell::IndexInterior(cell) = cell else {
+                                unreachable!(
+                                    "index interior page should only contain index interior cells"
+                                );
+                            };
+                            let key = parse_index_key(cell.payload, index_name)?;
+                            if key.indexed_value == Some(target) {
+                                visitor(key.rowid)?;
+                            }
+                            if ChildRange::between(lower_exclusive, key).contains(target) {
+                                pages_to_visit.push(cell.left_child_ptr);
+                            }
+                            lower_exclusive = Some(key);
+                            Ok::<(), anyhow::Error>(())
+                        })?;
 
-                    if let Some(right_most_ptr) = btree_page.right_most_ptr {
-                        child_ranges.push((right_most_ptr, lower_exclusive, None));
-                    }
-
-                    for (child_page, lower, upper) in child_ranges.into_iter().rev() {
-                        if range_overlaps(
-                            lower.as_ref(),
-                            upper.as_ref(),
-                            &lower_bound,
-                            &upper_bound,
-                        ) {
-                            pages_to_visit.push(child_page);
-                        }
+                    if let Some(right_most_ptr) = btree_page.right_most_ptr
+                        && ChildRange::right_of(lower_exclusive).contains(target)
+                    {
+                        pages_to_visit.push(right_most_ptr);
                     }
                 }
                 _ => {
@@ -104,11 +149,11 @@ impl<'a> IndexScanner<'a> {
             }
         }
 
-        Ok(rowids)
+        Ok(())
     }
 }
 
-fn parse_index_key(payload: &[u8], index_name: &str) -> Result<IndexKey> {
+fn parse_index_key<'a>(payload: &'a [u8], index_name: &str) -> Result<IndexKey<'a>> {
     let record = Record::parse(payload)?;
     let columns = record.columns();
     if columns.len() < 2 {
@@ -126,23 +171,87 @@ fn parse_index_key(payload: &[u8], index_name: &str) -> Result<IndexKey> {
             index_name: index_name.to_owned(),
         })?;
 
-    let rowid = u64::try_from(rowid).map_err(|_| SqliteParseError::MalformedIndexEntry {
-        index_name: index_name.to_owned(),
-    })?;
-
     Ok(IndexKey {
         indexed_value,
-        rowid,
+        rowid: u64::try_from(rowid).map_err(|_| SqliteParseError::MalformedIndexEntry {
+            index_name: index_name.to_owned(),
+        })?,
     })
 }
 
-fn range_overlaps(
-    lower_exclusive: Option<&IndexKey>,
-    upper_exclusive: Option<&IndexKey>,
-    lower_bound: &IndexKey,
-    upper_bound: &IndexKey,
-) -> bool {
-    let upper_overlaps = upper_exclusive.is_none_or(|upper| upper > lower_bound);
-    let lower_overlaps = lower_exclusive.is_none_or(|lower| upper_bound > lower);
-    upper_overlaps && lower_overlaps
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_range_contains_target_inside_bounds() {
+        let range = ChildRange::between(
+            Some(IndexKey {
+                indexed_value: Some("alpha"),
+                rowid: 10,
+            }),
+            IndexKey {
+                indexed_value: Some("gamma"),
+                rowid: 5,
+            },
+        );
+
+        assert!(range.contains("beta"));
+    }
+
+    #[test]
+    fn child_range_includes_exact_lower_value_for_equal_probe() {
+        let range = ChildRange::right_of(Some(IndexKey {
+            indexed_value: Some("eritrea"),
+            rowid: 17,
+        }));
+
+        assert!(range.contains("eritrea"));
+    }
+
+    #[test]
+    fn child_range_includes_exact_upper_value_for_equal_probe() {
+        let range = ChildRange::between(
+            None,
+            IndexKey {
+                indexed_value: Some("eritrea"),
+                rowid: 17,
+            },
+        );
+
+        assert!(range.contains("eritrea"));
+    }
+
+    #[test]
+    fn child_range_treats_none_bounds_as_unbounded() {
+        let range = ChildRange::right_of(None);
+
+        assert!(range.contains("eritrea"));
+    }
+
+    #[test]
+    fn null_indexed_values_sort_before_text() {
+        let key = IndexKey {
+            indexed_value: None,
+            rowid: 1,
+        };
+
+        assert_eq!(key.cmp_index_value("eritrea"), Ordering::Less);
+    }
+
+    #[test]
+    fn eritrea_boundary_child_range_still_contains_target() {
+        let range = ChildRange::between(
+            Some(IndexKey {
+                indexed_value: Some("egypt"),
+                rowid: 99,
+            }),
+            IndexKey {
+                indexed_value: Some("ethiopia"),
+                rowid: 1,
+            },
+        );
+
+        assert!(range.contains("eritrea"));
+    }
 }

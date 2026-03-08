@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
 use sqlparser::{
@@ -15,7 +16,7 @@ use crate::record::Record;
 const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct SchemaTable {
     entries: Vec<SchemaTableEntry>,
 }
@@ -59,7 +60,11 @@ impl SchemaTable {
         })
     }
 
-    pub fn find_index_for_column(&self, table_name: &str, column_name: &str) -> Option<&SchemaTableEntry> {
+    pub fn find_index_for_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Option<&SchemaTableEntry> {
         self.entries.iter().find(|entry| {
             entry.object_type == SchemaObjectType::Index
                 && entry.table_name.eq_ignore_ascii_case(table_name)
@@ -72,13 +77,14 @@ impl SchemaTable {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct SchemaTableEntry {
-    pub object_type: SchemaObjectType,
     pub name: String,
-    pub table_name: String,
     pub rootpage: Option<u32>,
-    pub sql: Option<String>,
+    object_type: SchemaObjectType,
+    table_name: String,
+    sql: Option<String>,
+    metadata: OnceLock<SchemaMetadata>,
 }
 
 impl SchemaTableEntry {
@@ -87,65 +93,37 @@ impl SchemaTableEntry {
             && !self.table_name.starts_with(SQLITE_INTERNAL_PREFIX)
     }
 
-    pub fn column_names(&self) -> Result<Vec<String>> {
-        Ok(self
-            .parse_create_table()?
-            .columns
-            .into_iter()
-            .map(|column| column.name.value)
-            .collect())
+    pub fn column_names(&self) -> Result<&[String]> {
+        match self.metadata()? {
+            SchemaMetadata::Table(table) => Ok(table.column_names.as_slice()),
+            _ => bail!(SqliteParseError::MalformedSchema {
+                object_name: self.table_name.clone(),
+            }),
+        }
     }
 
-    pub fn rowid_alias_column_name(&self) -> Result<Option<String>> {
-        Ok(self
-            .parse_create_table()?
-            .columns
-            .into_iter()
-            .find(|column| {
-                matches!(column.data_type, DataType::Integer(_))
-                    && column
-                        .options
-                        .iter()
-                        .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
-            })
-            .map(|column| column.name.value))
+    pub fn rowid_alias_column_name(&self) -> Result<Option<&str>> {
+        match self.metadata()? {
+            SchemaMetadata::Table(table) => Ok(table
+                .rowid_alias_index
+                .map(|index| table.column_names[index].as_str())),
+            _ => bail!(SqliteParseError::MalformedSchema {
+                object_name: self.table_name.clone(),
+            }),
+        }
     }
 
-    pub fn indexed_column_name(&self) -> Result<Option<String>> {
+    pub fn indexed_column_name(&self) -> Result<Option<&str>> {
         if self.object_type != SchemaObjectType::Index {
             return Ok(None);
         }
 
-        let create_index = self.parse_create_index()?;
-        if create_index.unique
-            || create_index.concurrently
-            || create_index.if_not_exists
-            || !create_index.include.is_empty()
-            || create_index.nulls_distinct.is_some()
-            || !create_index.with.is_empty()
-            || create_index.predicate.is_some()
-            || !create_index.index_options.is_empty()
-            || !create_index.alter_options.is_empty()
-            || create_index.using.is_some()
-            || create_index.columns.len() != 1
-        {
-            return Ok(None);
+        match self.metadata()? {
+            SchemaMetadata::Index(index) => Ok(index.indexed_column_name.as_deref()),
+            _ => bail!(SqliteParseError::MalformedSchema {
+                object_name: self.name.clone(),
+            }),
         }
-
-        let index_column = &create_index.columns[0];
-        if index_column.operator_class.is_some()
-            || index_column.column.options.asc.is_some()
-            || index_column.column.options.nulls_first.is_some()
-            || index_column.column.with_fill.is_some()
-        {
-            return Ok(None);
-        }
-
-        let Expr::Identifier(identifier) = &index_column.column.expr else {
-            return Ok(None);
-        };
-
-        Ok(Some(identifier.value.clone()))
     }
 
     pub fn column_index(&self, column_name: &str) -> Result<usize> {
@@ -159,6 +137,28 @@ impl SchemaTableEntry {
             .map_err(Into::into)
     }
 
+    fn metadata(&self) -> Result<&SchemaMetadata> {
+        if let Some(metadata) = self.metadata.get() {
+            return Ok(metadata);
+        }
+
+        let metadata = match self.object_type {
+            SchemaObjectType::Table => {
+                SchemaMetadata::Table(TableMetadata::from_create_table(self.parse_create_table()?))
+            }
+            SchemaObjectType::Index => {
+                SchemaMetadata::Index(IndexMetadata::from_create_index(self.parse_create_index()?))
+            }
+            _ => SchemaMetadata::Other,
+        };
+        let _ = self.metadata.set(metadata);
+
+        Ok(self
+            .metadata
+            .get()
+            .expect("schema metadata should be initialized"))
+    }
+
     fn parse_create_table(&self) -> Result<sqlparser::ast::CreateTable> {
         let sql = self
             .sql
@@ -168,11 +168,10 @@ impl SchemaTableEntry {
             })?;
 
         let dialect = SQLiteDialect {};
-        let mut statements = Parser::parse_sql(&dialect, sql).map_err(|_| {
-            SqliteParseError::MalformedSchema {
+        let mut statements =
+            Parser::parse_sql(&dialect, sql).map_err(|_| SqliteParseError::MalformedSchema {
                 object_name: self.table_name.clone(),
-            }
-        })?;
+            })?;
 
         if statements.len() != 1 {
             bail!(SqliteParseError::MalformedSchema {
@@ -199,11 +198,10 @@ impl SchemaTableEntry {
             })?;
 
         let dialect = SQLiteDialect {};
-        let mut statements = Parser::parse_sql(&dialect, sql).map_err(|_| {
-            SqliteParseError::MalformedSchema {
+        let mut statements =
+            Parser::parse_sql(&dialect, sql).map_err(|_| SqliteParseError::MalformedSchema {
                 object_name: self.name.clone(),
-            }
-        })?;
+            })?;
 
         if statements.len() != 1 {
             bail!(SqliteParseError::MalformedSchema {
@@ -232,7 +230,7 @@ impl SchemaTableEntry {
 
         let type_str = columns[0].decode_text(format!("{SCHEMA_TABLE_NAME}.type"))?;
         let object_type = SchemaObjectType::from_str(&type_str)
-            .map_err(|_| SqliteParseError::InvalidSchemaObjectType(type_str))?;
+            .map_err(|_| SqliteParseError::InvalidSchemaObjectType(type_str.to_owned()))?;
         let name = columns[1].decode_text(format!("{SCHEMA_TABLE_NAME}.name"))?;
         let table_name = columns[2].decode_text(format!("{SCHEMA_TABLE_NAME}.tbl_name"))?;
         let rootpage_integer =
@@ -246,11 +244,89 @@ impl SchemaTableEntry {
 
         Ok(Self {
             object_type,
-            name,
-            table_name,
+            name: name.to_owned(),
+            table_name: table_name.to_owned(),
             rootpage,
-            sql,
+            sql: sql.map(str::to_owned),
+            metadata: OnceLock::new(),
         })
+    }
+}
+
+#[derive(Debug)]
+enum SchemaMetadata {
+    Table(TableMetadata),
+    Index(IndexMetadata),
+    Other,
+}
+
+#[derive(Debug)]
+struct TableMetadata {
+    column_names: Vec<String>,
+    rowid_alias_index: Option<usize>,
+}
+
+impl TableMetadata {
+    fn from_create_table(create_table: sqlparser::ast::CreateTable) -> Self {
+        let rowid_alias_index = create_table.columns.iter().position(|column| {
+            matches!(column.data_type, DataType::Integer(_))
+                && column
+                    .options
+                    .iter()
+                    .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
+        });
+        let column_names = create_table
+            .columns
+            .into_iter()
+            .map(|column| column.name.value)
+            .collect();
+
+        Self {
+            column_names,
+            rowid_alias_index,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IndexMetadata {
+    indexed_column_name: Option<String>,
+}
+
+impl IndexMetadata {
+    fn from_create_index(create_index: sqlparser::ast::CreateIndex) -> Self {
+        let indexed_column_name = if create_index.unique
+            || create_index.concurrently
+            || create_index.if_not_exists
+            || !create_index.include.is_empty()
+            || create_index.nulls_distinct.is_some()
+            || !create_index.with.is_empty()
+            || create_index.predicate.is_some()
+            || !create_index.index_options.is_empty()
+            || !create_index.alter_options.is_empty()
+            || create_index.using.is_some()
+            || create_index.columns.len() != 1
+        {
+            None
+        } else {
+            let index_column = &create_index.columns[0];
+            if index_column.operator_class.is_some()
+                || index_column.column.options.asc.is_some()
+                || index_column.column.options.nulls_first.is_some()
+                || index_column.column.with_fill.is_some()
+            {
+                None
+            } else {
+                match &index_column.column.expr {
+                    Expr::Identifier(identifier) => Some(identifier.value.clone()),
+                    _ => None,
+                }
+            }
+        };
+
+        Self {
+            indexed_column_name,
+        }
     }
 }
 
@@ -278,6 +354,7 @@ mod tests {
                 "CREATE TABLE apples (id integer primary key autoincrement, name text, color text)"
                     .to_owned(),
             ),
+            metadata: OnceLock::new(),
         };
 
         assert_eq!(
@@ -285,10 +362,7 @@ mod tests {
             vec!["id".to_owned(), "name".to_owned(), "color".to_owned()]
         );
         assert_eq!(entry.column_index("name").unwrap(), 1);
-        assert_eq!(
-            entry.rowid_alias_column_name().unwrap(),
-            Some("id".to_owned())
-        );
+        assert_eq!(entry.rowid_alias_column_name().unwrap(), Some("id"));
     }
 
     #[test]
@@ -299,8 +373,9 @@ mod tests {
             table_name: "companies".to_owned(),
             rootpage: Some(4),
             sql: Some("CREATE INDEX idx_companies_country ON companies (country)".to_owned()),
+            metadata: OnceLock::new(),
         };
 
-        assert_eq!(entry.indexed_column_name().unwrap(), Some("country".to_owned()));
+        assert_eq!(entry.indexed_column_name().unwrap(), Some("country"));
     }
 }
