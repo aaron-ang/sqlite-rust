@@ -72,9 +72,20 @@ mod tests {
     fn parses_column_query() {
         assert_eq!(
             UserInput::parse("SELECT name FROM apples").unwrap(),
-            UserInput::Sql(SqlStatement::SelectColumn {
+            UserInput::Sql(SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
-                column_name: "name".to_owned(),
+                column_names: vec!["name".to_owned()],
+            })
+        );
+    }
+
+    #[test]
+    fn parses_multi_column_query() {
+        assert_eq!(
+            UserInput::parse("SELECT name, color FROM apples").unwrap(),
+            UserInput::Sql(SqlStatement::SelectColumns {
+                table_name: "apples".to_owned(),
+                column_names: vec!["name".to_owned(), "color".to_owned()],
             })
         );
     }

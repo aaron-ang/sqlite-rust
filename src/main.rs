@@ -21,14 +21,14 @@ fn main() -> Result<()> {
         UserInput::Sql(SqlStatement::SelectCount { table_name }) => {
             println!("{}", database.count_rows(&table_name)?);
         }
-        UserInput::Sql(SqlStatement::SelectColumn {
+        UserInput::Sql(SqlStatement::SelectColumns {
             table_name,
-            column_name,
+            column_names,
         }) => {
             println!(
                 "{}",
                 database
-                    .select_column_values(&table_name, &column_name)?
+                    .select_rows(&table_name, &column_names)?
                     .join("\n")
             );
         }

@@ -91,9 +91,12 @@ impl SqliteDB {
         Ok(usize::from(btree_page.cell_count))
     }
 
-    pub fn select_column_values(&self, table_name: &str, column_name: &str) -> Result<Vec<String>> {
+    pub fn select_rows(&self, table_name: &str, column_names: &[String]) -> Result<Vec<String>> {
         let (entry, page, btree_page) = self.read_table_root_page(table_name)?;
-        let column_index = entry.column_index(column_name)?;
+        let column_indices = column_names
+            .iter()
+            .map(|column_name| entry.column_index(column_name))
+            .collect::<Result<Vec<_>>>()?;
 
         btree_page
             .cells(&page)?
@@ -101,10 +104,18 @@ impl SqliteDB {
             .map(|cell| match cell {
                 BTreeCell::TableLeaf(cell) => {
                     let record = Record::parse(cell.payload)?;
-                    let column = record
-                        .column(column_index)
-                        .ok_or(SqliteParseError::RecordColumnOutOfBounds { column_index })?;
-                    column.decode_text(format!("{table_name}.{column_name}"))
+                    let values = column_names
+                        .iter()
+                        .zip(&column_indices)
+                        .map(|(column_name, &column_index)| {
+                            let column = record.column(column_index).ok_or(
+                                SqliteParseError::RecordColumnOutOfBounds { column_index },
+                            )?;
+                            column.decode_text(format!("{table_name}.{column_name}"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+
+                    Ok(values.join("|"))
                 }
                 _ => unreachable!("table root page must be a table leaf page"),
             })
@@ -249,7 +260,7 @@ mod tests {
         let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
 
         let mut values = database
-            .select_column_values("apples", "name")
+            .select_rows("apples", &["name".to_owned()])
             .expect("apples names should parse");
         values.sort();
 
@@ -284,7 +295,70 @@ mod tests {
         let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
 
         let error = database
-            .select_column_values("apples", "missing_col")
+            .select_rows("apples", &["missing_col".to_owned()])
+            .unwrap_err();
+        let error = error
+            .downcast_ref::<SqliteParseError>()
+            .expect("error should downcast to SqliteParseError");
+
+        assert!(matches!(
+            error,
+            SqliteParseError::ColumnNotFound {
+                table_name,
+                column_name,
+            } if table_name == "apples" && column_name == "missing_col"
+        ));
+    }
+
+    #[test]
+    fn selects_multi_column_rows_from_apples_table() {
+        let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
+
+        let mut rows = database
+            .select_rows("apples", &["name".to_owned(), "color".to_owned()])
+            .expect("apples rows should parse");
+        rows.sort();
+
+        assert_eq!(
+            rows,
+            vec![
+                "Fuji|Red".to_owned(),
+                "Golden Delicious|Yellow".to_owned(),
+                "Granny Smith|Light Green".to_owned(),
+                "Honeycrisp|Blush Red".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_projection_order_in_multi_column_rows() {
+        let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
+
+        let mut rows = database
+            .select_rows("apples", &["color".to_owned(), "name".to_owned()])
+            .expect("apples rows should parse");
+        rows.sort();
+
+        assert_eq!(
+            rows,
+            vec![
+                "Blush Red|Honeycrisp".to_owned(),
+                "Light Green|Granny Smith".to_owned(),
+                "Red|Fuji".to_owned(),
+                "Yellow|Golden Delicious".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_one_of_multiple_columns_returns_column_not_found() {
+        let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
+
+        let error = database
+            .select_rows(
+                "apples",
+                &["name".to_owned(), "missing_col".to_owned()],
+            )
             .unwrap_err();
         let error = error
             .downcast_ref::<SqliteParseError>()

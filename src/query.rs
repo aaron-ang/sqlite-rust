@@ -13,9 +13,9 @@ pub enum SqlStatement {
     SelectCount {
         table_name: String,
     },
-    SelectColumn {
+    SelectColumns {
         table_name: String,
-        column_name: String,
+        column_names: Vec<String>,
     },
 }
 
@@ -51,17 +51,23 @@ impl SqlStatement {
         validate_select(&select, sql)?;
 
         let table_name = parse_table_name(&select.from[0].relation, &select.from[0].joins, sql)?;
-
-        match &select.projection[0] {
-            SelectItem::UnnamedExpr(Expr::Identifier(identifier)) => Ok(Self::SelectColumn {
-                table_name,
-                column_name: identifier.value.clone(),
-            }),
-            SelectItem::UnnamedExpr(Expr::Function(function)) if is_count_star(function) => {
-                Ok(Self::SelectCount { table_name })
-            }
-            _ => bail!(SqliteParseError::UnsupportedSql(sql.to_owned())),
+        if let [SelectItem::UnnamedExpr(Expr::Function(function))] = select.projection.as_slice()
+            && is_count_star(function)
+        {
+            return Ok(Self::SelectCount { table_name });
         }
+
+        let column_names = select
+            .projection
+            .iter()
+            .map(parse_projection_column)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| SqliteParseError::UnsupportedSql(sql.to_owned()))?;
+
+        Ok(Self::SelectColumns {
+            table_name,
+            column_names,
+        })
     }
 }
 
@@ -123,7 +129,7 @@ fn validate_select(select: &Select, sql: &str) -> Result<()> {
         || select.having.is_some()
         || !select.named_window.is_empty()
         || select.from.len() != 1
-        || select.projection.len() != 1
+        || select.projection.is_empty()
     {
         bail!(SqliteParseError::UnsupportedSql(sql.to_owned()));
     }
@@ -196,6 +202,13 @@ fn is_count_star(function: &sqlparser::ast::Function) -> bool {
         && function.null_treatment.is_none()
         && function.over.is_none()
         && function.within_group.is_empty()
+}
+
+fn parse_projection_column(select_item: &SelectItem) -> Option<String> {
+    match select_item {
+        SelectItem::UnnamedExpr(Expr::Identifier(identifier)) => Some(identifier.value.clone()),
+        _ => None,
+    }
 }
 
 fn map_parser_error(error: ParserError) -> anyhow::Error {
@@ -289,9 +302,20 @@ mod tests {
     fn parses_single_column_query() {
         assert_eq!(
             SqlStatement::parse("SELECT name FROM apples").unwrap(),
-            SqlStatement::SelectColumn {
+            SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
-                column_name: "name".to_owned(),
+                column_names: vec!["name".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_multi_column_query() {
+        assert_eq!(
+            SqlStatement::parse("SELECT name, color FROM apples").unwrap(),
+            SqlStatement::SelectColumns {
+                table_name: "apples".to_owned(),
+                column_names: vec!["name".to_owned(), "color".to_owned()],
             }
         );
     }
@@ -313,14 +337,27 @@ mod tests {
 
     #[test]
     fn rejects_multiple_columns_as_unsupported_feature() {
-        let error = SqlStatement::parse("SELECT id, name FROM apples").unwrap_err();
+        let error = SqlStatement::parse("SELECT name AS n FROM apples").unwrap_err();
         let error = error
             .downcast_ref::<SqliteParseError>()
             .expect("error should downcast to SqliteParseError");
 
         assert!(matches!(
             error,
-            SqliteParseError::UnsupportedSql(sql) if sql == "SELECT id, name FROM apples"
+            SqliteParseError::UnsupportedSql(sql) if sql == "SELECT name AS n FROM apples"
+        ));
+    }
+
+    #[test]
+    fn rejects_expression_projection_as_unsupported_feature() {
+        let error = SqlStatement::parse("SELECT upper(name) FROM apples").unwrap_err();
+        let error = error
+            .downcast_ref::<SqliteParseError>()
+            .expect("error should downcast to SqliteParseError");
+
+        assert!(matches!(
+            error,
+            SqliteParseError::UnsupportedSql(sql) if sql == "SELECT upper(name) FROM apples"
         ));
     }
 
