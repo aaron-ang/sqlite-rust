@@ -62,7 +62,7 @@ impl<'a> Record<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RecordColumn<'a> {
     serial_type: SerialType,
     value: &'a [u8],
@@ -112,7 +112,7 @@ impl<'a> RecordColumn<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum SerialType {
     Fixed(FixedSerialType),
     Blob(usize),
@@ -165,7 +165,7 @@ impl TryFrom<u64> for SerialType {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
+#[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u64)]
 enum FixedSerialType {
     Null = 0,

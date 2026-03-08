@@ -206,7 +206,7 @@ impl BTreePageKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FreelistPageKind {
     Trunk,
     Leaf,

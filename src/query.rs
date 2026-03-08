@@ -1,14 +1,14 @@
 use anyhow::{Result, bail};
 use sqlparser::ast::{
-    Expr, Fetch, FunctionArg, FunctionArgExpr, FunctionArguments, LockClause, Select, SelectItem,
-    SetExpr, Statement, TableFactor, Top, TopQuantity,
+    BinaryOperator, Expr, Fetch, FunctionArg, FunctionArgExpr, FunctionArguments, LockClause,
+    Select, SelectItem, SetExpr, Statement, TableFactor, Top, TopQuantity, Value,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::{Parser, ParserError};
 
 use crate::error::SqliteParseError;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SqlStatement {
     SelectCount {
         table_name: String,
@@ -16,7 +16,13 @@ pub enum SqlStatement {
     SelectColumns {
         table_name: String,
         column_names: Vec<String>,
+        where_clause: Option<WhereClause>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WhereClause {
+    EqualsText { column_name: String, value: String },
 }
 
 impl SqlStatement {
@@ -63,10 +69,12 @@ impl SqlStatement {
             .map(parse_projection_column)
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| SqliteParseError::UnsupportedSql(sql.to_owned()))?;
+        let where_clause = parse_where_clause(select.selection.as_ref(), sql)?;
 
         Ok(Self::SelectColumns {
             table_name,
             column_names,
+            where_clause,
         })
     }
 }
@@ -121,7 +129,6 @@ fn validate_select(select: &Select, sql: &str) -> Result<()> {
 
     if select.distinct.is_some()
         || select.into.is_some()
-        || select.selection.is_some()
         || !select.group_by.is_empty()
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
@@ -209,6 +216,37 @@ fn parse_projection_column(select_item: &SelectItem) -> Option<String> {
         SelectItem::UnnamedExpr(Expr::Identifier(identifier)) => Some(identifier.value.clone()),
         _ => None,
     }
+}
+
+fn parse_where_clause(selection: Option<&Expr>, sql: &str) -> Result<Option<WhereClause>> {
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+
+    let Expr::BinaryOp { left, op, right } = selection else {
+        bail!(SqliteParseError::UnsupportedSql(sql.to_owned()));
+    };
+
+    if *op != BinaryOperator::Eq {
+        bail!(SqliteParseError::UnsupportedSql(sql.to_owned()));
+    }
+
+    let Expr::Identifier(identifier) = left.as_ref() else {
+        bail!(SqliteParseError::UnsupportedSql(sql.to_owned()));
+    };
+
+    let Expr::Value(value) = right.as_ref() else {
+        bail!(SqliteParseError::UnsupportedSql(sql.to_owned()));
+    };
+
+    let Value::SingleQuotedString(text) = &value.value else {
+        bail!(SqliteParseError::UnsupportedSql(sql.to_owned()));
+    };
+
+    Ok(Some(WhereClause::EqualsText {
+        column_name: identifier.value.clone(),
+        value: text.clone(),
+    }))
 }
 
 fn map_parser_error(error: ParserError) -> anyhow::Error {
@@ -305,6 +343,7 @@ mod tests {
             SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
                 column_names: vec!["name".to_owned()],
+                where_clause: None,
             }
         );
     }
@@ -316,14 +355,30 @@ mod tests {
             SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
                 column_names: vec!["name".to_owned(), "color".to_owned()],
+                where_clause: None,
             }
         );
     }
 
     #[test]
-    fn rejects_where_clause_as_unsupported_feature() {
+    fn parses_where_clause() {
+        assert_eq!(
+            SqlStatement::parse("SELECT name, color FROM apples WHERE color = 'Yellow'").unwrap(),
+            SqlStatement::SelectColumns {
+                table_name: "apples".to_owned(),
+                column_names: vec!["name".to_owned(), "color".to_owned()],
+                where_clause: Some(WhereClause::EqualsText {
+                    column_name: "color".to_owned(),
+                    value: "Yellow".to_owned(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_where_operator() {
         let error =
-            SqlStatement::parse("SELECT name FROM apples WHERE color = 'green'").unwrap_err();
+            SqlStatement::parse("SELECT name FROM apples WHERE color != 'green'").unwrap_err();
         let error = error
             .downcast_ref::<SqliteParseError>()
             .expect("error should downcast to SqliteParseError");
@@ -331,7 +386,7 @@ mod tests {
         assert!(matches!(
             error,
             SqliteParseError::UnsupportedSql(sql)
-                if sql == "SELECT name FROM apples WHERE color = 'green'"
+                if sql == "SELECT name FROM apples WHERE color != 'green'"
         ));
     }
 
@@ -358,6 +413,52 @@ mod tests {
         assert!(matches!(
             error,
             SqliteParseError::UnsupportedSql(sql) if sql == "SELECT upper(name) FROM apples"
+        ));
+    }
+
+    #[test]
+    fn rejects_function_in_where_clause() {
+        let error = SqlStatement::parse("SELECT name FROM apples WHERE upper(color) = 'YELLOW'")
+            .unwrap_err();
+        let error = error
+            .downcast_ref::<SqliteParseError>()
+            .expect("error should downcast to SqliteParseError");
+
+        assert!(matches!(
+            error,
+            SqliteParseError::UnsupportedSql(sql)
+                if sql == "SELECT name FROM apples WHERE upper(color) = 'YELLOW'"
+        ));
+    }
+
+    #[test]
+    fn rejects_numeric_literal_in_where_clause() {
+        let error = SqlStatement::parse("SELECT name FROM apples WHERE color = 1").unwrap_err();
+        let error = error
+            .downcast_ref::<SqliteParseError>()
+            .expect("error should downcast to SqliteParseError");
+
+        assert!(matches!(
+            error,
+            SqliteParseError::UnsupportedSql(sql)
+                if sql == "SELECT name FROM apples WHERE color = 1"
+        ));
+    }
+
+    #[test]
+    fn rejects_and_in_where_clause() {
+        let error = SqlStatement::parse(
+            "SELECT name FROM apples WHERE color = 'Yellow' AND name = 'Fuji'",
+        )
+        .unwrap_err();
+        let error = error
+            .downcast_ref::<SqliteParseError>()
+            .expect("error should downcast to SqliteParseError");
+
+        assert!(matches!(
+            error,
+            SqliteParseError::UnsupportedSql(sql)
+                if sql == "SELECT name FROM apples WHERE color = 'Yellow' AND name = 'Fuji'"
         ));
     }
 

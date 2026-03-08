@@ -24,11 +24,12 @@ fn main() -> Result<()> {
         UserInput::Sql(SqlStatement::SelectColumns {
             table_name,
             column_names,
+            where_clause,
         }) => {
             println!(
                 "{}",
                 database
-                    .select_rows(&table_name, &column_names)?
+                    .select_rows(&table_name, &column_names, where_clause.as_ref())?
                     .join("\n")
             );
         }
