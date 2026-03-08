@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod db;
 pub mod error;
+pub mod index;
 pub mod page;
 pub mod query;
 pub mod record;

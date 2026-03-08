@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::error::SqliteParseError;
+use crate::index::IndexScanner;
 use crate::page::{BTreePage, BTreePageKind};
 use crate::query::WhereClause;
 use crate::record::Record;
@@ -166,41 +167,135 @@ impl SqliteDB {
         where_clause: Option<&WhereClause>,
     ) -> Result<Vec<String>> {
         let (entry, rootpage) = self.resolve_table_root(table_name)?;
-        let resolved_columns = column_names
-            .iter()
-            .map(|column_name| ResolvedColumn::resolve(&entry, column_name))
-            .collect::<Result<Vec<_>>>()?;
-        let predicate = match where_clause {
-            Some(WhereClause::EqualsText { column_name, value }) => {
-                Some((ResolvedColumn::resolve(&entry, column_name)?, value.clone()))
-            }
-            None => None,
-        };
+        let resolved_columns = Self::resolve_columns(&entry, column_names)?;
+        let predicate = Self::resolve_predicate(&entry, where_clause)?;
+
+        if let Some(WhereClause::EqualsText { column_name, value }) = where_clause
+            && let Some(index_entry) = self
+                .schema_table
+                .find_index_for_column(table_name, column_name)
+        {
+            return self.select_rows_via_index_scan(
+                table_name,
+                rootpage,
+                &resolved_columns,
+                index_entry,
+                value,
+            );
+        }
+
+        self.select_rows_via_table_scan(table_name, rootpage, &resolved_columns, predicate.as_ref())
+    }
+
+    fn select_rows_via_table_scan(
+        &self,
+        table_name: &str,
+        rootpage: u32,
+        resolved_columns: &[ResolvedColumn],
+        predicate: Option<&(ResolvedColumn, String)>,
+    ) -> Result<Vec<String>> {
         let scanner = TableScanner::new(self);
         let mut rows = Vec::new();
 
         scanner.visit_records(table_name, rootpage, |rowid, record| {
-            if let Some((predicate_column, predicate_value)) = predicate.as_ref() {
-                if !predicate_column.matches_text_literal(
+            if let Some((predicate_column, predicate_value)) = predicate
+                && !predicate_column.matches_text_literal(
                     table_name,
                     rowid,
                     &record,
                     predicate_value,
-                )? {
-                    return Ok(());
-                }
+                )?
+            {
+                return Ok(());
             }
 
-            let values = resolved_columns
-                .iter()
-                .map(|column| column.decode_output(table_name, rowid, &record))
-                .collect::<Result<Vec<_>>>()?;
-
-            rows.push(values.join("|"));
+            rows.push(Self::project_row(
+                table_name,
+                rowid,
+                &record,
+                resolved_columns,
+            )?);
             Ok(())
         })?;
 
         Ok(rows)
+    }
+
+    fn select_rows_via_index_scan(
+        &self,
+        table_name: &str,
+        table_rootpage: u32,
+        resolved_columns: &[ResolvedColumn],
+        index_entry: &SchemaTableEntry,
+        predicate_value: &str,
+    ) -> Result<Vec<String>> {
+        let index_rootpage =
+            index_entry
+                .rootpage
+                .ok_or_else(|| SqliteParseError::MissingRootPage {
+                    object_type: "index",
+                    object_name: index_entry.name.clone(),
+                })?;
+        let index_scanner = IndexScanner::new(self);
+        let table_scanner = TableScanner::new(self);
+        let rowids = index_scanner.find_matching_rowids(
+            &index_entry.name,
+            index_rootpage,
+            predicate_value,
+        )?;
+        let mut rows = Vec::with_capacity(rowids.len());
+
+        for rowid in rowids {
+            if let Some(row) =
+                table_scanner.find_record_by_rowid(table_name, table_rootpage, rowid)?
+            {
+                let record = Record::parse(&row.payload)?;
+                rows.push(Self::project_row(
+                    table_name,
+                    row.rowid,
+                    &record,
+                    resolved_columns,
+                )?);
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn project_row(
+        table_name: &str,
+        rowid: u64,
+        record: &Record<'_>,
+        resolved_columns: &[ResolvedColumn],
+    ) -> Result<String> {
+        Ok(resolved_columns
+            .iter()
+            .map(|column| column.decode_output(table_name, rowid, record))
+            .collect::<Result<Vec<_>>>()?
+            .join("|"))
+    }
+
+    fn resolve_columns(
+        entry: &SchemaTableEntry,
+        column_names: &[String],
+    ) -> Result<Vec<ResolvedColumn>> {
+        column_names
+            .iter()
+            .map(|column_name| ResolvedColumn::resolve(entry, column_name))
+            .collect()
+    }
+
+    fn resolve_predicate(
+        entry: &SchemaTableEntry,
+        where_clause: Option<&WhereClause>,
+    ) -> Result<Option<(ResolvedColumn, String)>> {
+        match where_clause {
+            Some(WhereClause::EqualsText { column_name, value }) => Ok(Some((
+                ResolvedColumn::resolve(entry, column_name)?,
+                value.clone(),
+            ))),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn read_btree_page(&self, page_number: u32) -> Result<(Vec<u8>, BTreePage)> {
@@ -222,8 +317,9 @@ impl SqliteDB {
             .ok_or_else(|| SqliteParseError::TableNotFound(table_name.to_owned()))?;
         let rootpage = entry
             .rootpage
-            .ok_or_else(|| SqliteParseError::MissingTableRootPage {
-                table_name: table_name.to_owned(),
+            .ok_or_else(|| SqliteParseError::MissingRootPage {
+                object_type: "table",
+                object_name: table_name.to_owned(),
             })?;
 
         Ok((entry, rootpage))
@@ -268,6 +364,10 @@ mod tests {
 
     fn superheroes_db_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("superheroes.db")
+    }
+
+    fn companies_db_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("companies.db")
     }
 
     #[test]
@@ -572,6 +672,86 @@ mod tests {
                 "3289|Angora Lapin (New Earth)".to_owned(),
                 "3913|Matris Ater Clementia (New Earth)".to_owned(),
                 "790|Tobias Whale (New Earth)".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_companies_country_index() {
+        let database = SqliteDB::open(&companies_db_path()).expect("companies db should open");
+
+        let index = database
+            .schema_table
+            .find_index_for_column("companies", "country")
+            .expect("country index should exist");
+
+        assert_eq!(index.name, "idx_companies_country");
+        assert_eq!(index.rootpage, Some(4));
+    }
+
+    #[test]
+    fn companies_index_root_page_is_index_interior() {
+        let database = SqliteDB::open(&companies_db_path()).expect("companies db should open");
+        let index = database
+            .schema_table
+            .find_index_for_column("companies", "country")
+            .expect("country index should exist");
+        let rootpage = index.rootpage.expect("index should have root page");
+        let (_, btree_page) = database
+            .read_btree_page(rootpage)
+            .expect("index root page should be readable");
+
+        assert_eq!(btree_page.kind, BTreePageKind::IndexInterior);
+    }
+
+    #[test]
+    fn finds_company_row_by_rowid() {
+        let database = SqliteDB::open(&companies_db_path()).expect("companies db should open");
+        let companies = database
+            .schema_table
+            .find_table("companies")
+            .expect("companies table should exist");
+        let rootpage = companies.rootpage.expect("companies should have root page");
+        let scanner = TableScanner::new(&database);
+        let row = scanner
+            .find_record_by_rowid("companies", rootpage, 121_311)
+            .expect("row lookup should succeed")
+            .expect("company row should exist");
+        let record = Record::parse(&row.payload).expect("company record should parse");
+
+        assert_eq!(
+            record
+                .column(companies.column_index("name").unwrap())
+                .unwrap()
+                .decode_text("companies.name")
+                .unwrap(),
+            "unilink s.c."
+        );
+    }
+
+    #[test]
+    fn selects_rows_from_companies_via_index_scan() {
+        let database = SqliteDB::open(&companies_db_path()).expect("companies db should open");
+
+        let mut rows = database
+            .select_rows(
+                "companies",
+                &["id".to_owned(), "name".to_owned()],
+                Some(&WhereClause::EqualsText {
+                    column_name: "country".to_owned(),
+                    value: "eritrea".to_owned(),
+                }),
+            )
+            .expect("indexed companies rows should parse");
+        rows.sort();
+
+        assert_eq!(
+            rows,
+            vec![
+                "121311|unilink s.c.".to_owned(),
+                "2102438|orange asmara it solutions".to_owned(),
+                "5729848|zara mining share company".to_owned(),
+                "6634629|asmara rental".to_owned(),
             ]
         );
     }

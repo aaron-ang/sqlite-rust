@@ -5,6 +5,12 @@ use crate::error::SqliteParseError;
 use crate::page::{BTreeCell, BTreePageKind};
 use crate::record::Record;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableRow {
+    pub rowid: u64,
+    pub payload: Vec<u8>,
+}
+
 pub struct TableScanner<'a> {
     db: &'a SqliteDB,
 }
@@ -51,8 +57,9 @@ impl<'a> TableScanner<'a> {
                         .get(btree_page.header_offset)
                         .copied()
                         .unwrap_or_default();
-                    bail!(SqliteParseError::UnsupportedTablePageType {
-                        table_name: table_name.to_owned(),
+                    bail!(SqliteParseError::UnsupportedRootPageType {
+                        object_type: "table",
+                        object_name: table_name.to_owned(),
                         page_type,
                     });
                 }
@@ -60,5 +67,73 @@ impl<'a> TableScanner<'a> {
         }
 
         Ok(())
+    }
+
+    pub fn find_record_by_rowid(
+        &self,
+        table_name: &str,
+        root_page: u32,
+        target_rowid: u64,
+    ) -> Result<Option<TableRow>> {
+        let mut current_page = root_page;
+
+        loop {
+            let (page_bytes, btree_page) = self.db.read_btree_page(current_page)?;
+
+            match btree_page.kind {
+                BTreePageKind::TableLeaf => {
+                    for cell in btree_page.cells(&page_bytes)? {
+                        let BTreeCell::TableLeaf(cell) = cell else {
+                            unreachable!("table leaf page should only contain table leaf cells");
+                        };
+                        if cell.rowid.value() == target_rowid {
+                            return Ok(Some(TableRow {
+                                rowid: target_rowid,
+                                payload: cell.payload.to_vec(),
+                            }));
+                        }
+                    }
+
+                    return Ok(None);
+                }
+                BTreePageKind::TableInterior => {
+                    let mut next_page = btree_page.right_most_ptr.ok_or(
+                        SqliteParseError::UnsupportedRootPageType {
+                            object_type: "table",
+                            object_name: table_name.to_owned(),
+                            page_type: page_bytes
+                                .get(btree_page.header_offset)
+                                .copied()
+                                .unwrap_or_default(),
+                        },
+                    )?;
+
+                    for cell in btree_page.cells(&page_bytes)? {
+                        let BTreeCell::TableInterior(cell) = cell else {
+                            unreachable!(
+                                "table interior page should only contain table interior cells"
+                            );
+                        };
+                        if target_rowid <= cell.key.value() {
+                            next_page = cell.left_child_ptr;
+                            break;
+                        }
+                    }
+
+                    current_page = next_page;
+                }
+                _ => {
+                    let page_type = page_bytes
+                        .get(btree_page.header_offset)
+                        .copied()
+                        .unwrap_or_default();
+                    bail!(SqliteParseError::UnsupportedRootPageType {
+                        object_type: "table",
+                        object_name: table_name.to_owned(),
+                        page_type,
+                    });
+                }
+            }
+        }
     }
 }

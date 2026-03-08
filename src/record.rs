@@ -76,8 +76,9 @@ impl<'a> RecordColumn<'a> {
     pub fn decode_text(self, column: impl Into<String>) -> Result<String> {
         let column = column.into();
         if !self.serial_type.is_text() {
-            bail!(SqliteParseError::UnexpectedTextSerialType {
+            bail!(SqliteParseError::UnexpectedSerialType {
                 column,
+                expected: "text",
                 serial_type: self.serial_type.code(),
             });
         }
@@ -113,8 +114,9 @@ impl<'a> RecordColumn<'a> {
             return Ok(value.to_string());
         }
 
-        bail!(SqliteParseError::UnsupportedOutputSerialType {
+        bail!(SqliteParseError::UnexpectedSerialType {
             column,
+            expected: "text, integer, or null",
             serial_type: self.serial_type.code(),
         })
     }
@@ -128,8 +130,9 @@ impl<'a> RecordColumn<'a> {
                 SerialType::Fixed(FixedSerialType::One) => 1,
                 _ => decode_signed_integer(self.value),
             })),
-            _ => bail!(SqliteParseError::UnexpectedIntegerSerialType {
+            _ => bail!(SqliteParseError::UnexpectedSerialType {
                 column,
+                expected: "integer",
                 serial_type: self.serial_type.code(),
             }),
         }

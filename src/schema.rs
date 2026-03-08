@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use anyhow::{Result, bail};
 use sqlparser::{
-    ast::{ColumnOption, DataType, Statement},
+    ast::{ColumnOption, DataType, Expr, Statement},
     dialect::SQLiteDialect,
     parser::Parser,
 };
@@ -58,6 +58,18 @@ impl SchemaTable {
                 && entry.table_name.eq_ignore_ascii_case(name)
         })
     }
+
+    pub fn find_index_for_column(&self, table_name: &str, column_name: &str) -> Option<&SchemaTableEntry> {
+        self.entries.iter().find(|entry| {
+            entry.object_type == SchemaObjectType::Index
+                && entry.table_name.eq_ignore_ascii_case(table_name)
+                && entry
+                    .indexed_column_name()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column_name))
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -99,6 +111,43 @@ impl SchemaTableEntry {
             .map(|column| column.name.value))
     }
 
+    pub fn indexed_column_name(&self) -> Result<Option<String>> {
+        if self.object_type != SchemaObjectType::Index {
+            return Ok(None);
+        }
+
+        let create_index = self.parse_create_index()?;
+        if create_index.unique
+            || create_index.concurrently
+            || create_index.if_not_exists
+            || !create_index.include.is_empty()
+            || create_index.nulls_distinct.is_some()
+            || !create_index.with.is_empty()
+            || create_index.predicate.is_some()
+            || !create_index.index_options.is_empty()
+            || !create_index.alter_options.is_empty()
+            || create_index.using.is_some()
+            || create_index.columns.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let index_column = &create_index.columns[0];
+        if index_column.operator_class.is_some()
+            || index_column.column.options.asc.is_some()
+            || index_column.column.options.nulls_first.is_some()
+            || index_column.column.with_fill.is_some()
+        {
+            return Ok(None);
+        }
+
+        let Expr::Identifier(identifier) = &index_column.column.expr else {
+            return Ok(None);
+        };
+
+        Ok(Some(identifier.value.clone()))
+    }
+
     pub fn column_index(&self, column_name: &str) -> Result<usize> {
         self.column_names()?
             .iter()
@@ -114,31 +163,62 @@ impl SchemaTableEntry {
         let sql = self
             .sql
             .as_ref()
-            .ok_or_else(|| SqliteParseError::MissingCreateTableSql {
-                table_name: self.table_name.clone(),
+            .ok_or_else(|| SqliteParseError::MalformedSchema {
+                object_name: self.table_name.clone(),
             })?;
 
         let dialect = SQLiteDialect {};
         let mut statements = Parser::parse_sql(&dialect, sql).map_err(|_| {
-            SqliteParseError::UnsupportedCreateTableSql {
-                table_name: self.table_name.clone(),
+            SqliteParseError::MalformedSchema {
+                object_name: self.table_name.clone(),
             }
         })?;
 
         if statements.len() != 1 {
-            bail!(SqliteParseError::UnsupportedCreateTableSql {
-                table_name: self.table_name.clone(),
+            bail!(SqliteParseError::MalformedSchema {
+                object_name: self.table_name.clone(),
             });
         }
 
         let statement = statements.pop().expect("single statement must exist");
         let Statement::CreateTable(create_table) = statement else {
-            bail!(SqliteParseError::UnsupportedCreateTableSql {
-                table_name: self.table_name.clone(),
+            bail!(SqliteParseError::MalformedSchema {
+                object_name: self.table_name.clone(),
             });
         };
 
         Ok(create_table)
+    }
+
+    fn parse_create_index(&self) -> Result<sqlparser::ast::CreateIndex> {
+        let sql = self
+            .sql
+            .as_ref()
+            .ok_or_else(|| SqliteParseError::MalformedSchema {
+                object_name: self.name.clone(),
+            })?;
+
+        let dialect = SQLiteDialect {};
+        let mut statements = Parser::parse_sql(&dialect, sql).map_err(|_| {
+            SqliteParseError::MalformedSchema {
+                object_name: self.name.clone(),
+            }
+        })?;
+
+        if statements.len() != 1 {
+            bail!(SqliteParseError::MalformedSchema {
+                object_name: self.name.clone(),
+            });
+        }
+
+        let statement = statements.pop().expect("single statement must exist");
+        let Statement::CreateIndex(create_index) = statement else {
+            bail!(SqliteParseError::MalformedSchema {
+                object_name: self.name.clone(),
+            });
+        };
+
+        Ok(create_index)
     }
 
     fn parse_record(payload: &[u8]) -> Result<Self> {
@@ -209,5 +289,18 @@ mod tests {
             entry.rowid_alias_column_name().unwrap(),
             Some("id".to_owned())
         );
+    }
+
+    #[test]
+    fn parses_indexed_column_name_from_create_index_sql() {
+        let entry = SchemaTableEntry {
+            object_type: SchemaObjectType::Index,
+            name: "idx_companies_country".to_owned(),
+            table_name: "companies".to_owned(),
+            rootpage: Some(4),
+            sql: Some("CREATE INDEX idx_companies_country ON companies (country)".to_owned()),
+        };
+
+        assert_eq!(entry.indexed_column_name().unwrap(), Some("country".to_owned()));
     }
 }
