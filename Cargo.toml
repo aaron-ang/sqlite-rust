@@ -9,4 +9,6 @@ rust-version = "1.91"
 anyhow = "1.0.102"
 bytes = "1.11.1"
 clap = { version = "4.5.60", features = ["derive", "cargo"] }
+num_enum = "0.7.5"
+strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.18"

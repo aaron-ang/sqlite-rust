@@ -10,4 +10,30 @@ pub enum SqliteParseError {
     PageTooShort,
     #[error("unsupported sqlite_schema page type: 0x{0:02x}")]
     UnsupportedPageType(u8),
+    #[error("invalid or unterminated SQLite varint")]
+    InvalidVarint,
+    #[error("invalid SQLite record header size: {0}")]
+    InvalidRecordHeaderSize(u64),
+    #[error("unsupported SQLite serial type: {0}")]
+    UnsupportedSerialType(u64),
+    #[error("expected text serial type for sqlite_schema.{column}, found {serial_type}")]
+    UnexpectedTextSerialType {
+        column: &'static str,
+        serial_type: u64,
+    },
+    #[error("expected integer serial type for sqlite_schema.{column}, found {serial_type}")]
+    UnexpectedIntegerSerialType {
+        column: &'static str,
+        serial_type: u64,
+    },
+    #[error("invalid UTF-8 in sqlite_schema.{column}")]
+    InvalidUtf8 { column: &'static str },
+    #[error("invalid sqlite_schema.type value: {0}")]
+    InvalidSchemaObjectType(String),
+    #[error("invalid sqlite_schema.rootpage value: {0}")]
+    InvalidRootPage(i64),
+    #[error("cell pointer {0} is out of bounds")]
+    CellPointerOutOfBounds(usize),
+    #[error("cell payload at offset {offset} exceeds page bounds")]
+    CellPayloadOutOfBounds { offset: usize },
 }

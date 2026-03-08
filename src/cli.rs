@@ -12,4 +12,6 @@ pub struct Cli {
 pub enum Command {
     #[value(name = ".dbinfo")]
     DbInfo,
+    #[value(name = ".tables")]
+    Tables,
 }

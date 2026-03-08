@@ -2,21 +2,23 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::error::SqliteParseError;
+use crate::page::{BTreePage, BTreePageKind};
+use crate::schema_table::SchemaTable;
 
 const SQLITE_HEADER_LEN: usize = 100;
 const SQLITE_MAGIC_HEADER: &[u8; 16] = b"SQLite format 3\0";
-const TABLE_LEAF_PAGE_TYPE: u8 = 0x0d;
 
 #[derive(Debug)]
-pub struct SqliteDatabase {
+pub struct SqliteDB {
     header: DatabaseHeader,
-    schema_page_header: BTreePageHeader,
+    schema_page: BTreePage,
+    schema_table: SchemaTable,
 }
 
-impl SqliteDatabase {
+impl SqliteDB {
     pub fn open(path: &Path) -> Result<Self> {
         let mut file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -32,19 +34,40 @@ impl SqliteDatabase {
         file.read_exact(&mut page_one[SQLITE_HEADER_LEN..])
             .context("failed to read SQLite page 1")?;
 
-        let schema_page_header = BTreePageHeader::parse_page_one(&page_one)?;
+        let schema_page = BTreePage::parse_page_one(&page_one)?;
+        if schema_page.kind != BTreePageKind::TableLeaf {
+            bail!(SqliteParseError::UnsupportedPageType(
+                page_one[SQLITE_HEADER_LEN]
+            ));
+        }
+
+        let schema_table = SchemaTable::parse(&page_one, &schema_page)?;
 
         Ok(Self {
             header,
-            schema_page_header,
+            schema_page,
+            schema_table,
         })
     }
 
     pub fn db_info(&self) -> DbInfo {
         DbInfo {
             page_size: self.header.page_size,
-            table_count: self.schema_page_header.cell_count,
+            table_count: self.schema_page.cell_count,
         }
+    }
+
+    pub fn schema_table(&self) -> &SchemaTable {
+        &self.schema_table
+    }
+
+    pub fn table_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .schema_table
+            .user_table_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect())
     }
 }
 
@@ -62,46 +85,23 @@ struct DatabaseHeader {
 impl DatabaseHeader {
     fn parse(bytes: &[u8; SQLITE_HEADER_LEN]) -> Result<Self> {
         if &bytes[..SQLITE_MAGIC_HEADER.len()] != SQLITE_MAGIC_HEADER {
-            return Err(SqliteParseError::InvalidFileHeader.into());
+            bail!(SqliteParseError::InvalidFileHeader);
         }
 
         let raw_page_size = u16::from_be_bytes([bytes[16], bytes[17]]);
         let page_size = match raw_page_size {
             1 => 65_536,
             512..=32_768 if raw_page_size.is_power_of_two() => raw_page_size as u32,
-            other => return Err(SqliteParseError::InvalidPageSize(other).into()),
+            other => bail!(SqliteParseError::InvalidPageSize(other)),
         };
 
         Ok(Self { page_size })
     }
 }
 
-#[derive(Debug)]
-struct BTreePageHeader {
-    cell_count: u16,
-}
-
-impl BTreePageHeader {
-    fn parse_page_one(page: &[u8]) -> Result<Self> {
-        if page.len() < SQLITE_HEADER_LEN + 8 {
-            return Err(SqliteParseError::PageTooShort.into());
-        }
-
-        let page_type = page[SQLITE_HEADER_LEN];
-        if page_type != TABLE_LEAF_PAGE_TYPE {
-            return Err(SqliteParseError::UnsupportedPageType(page_type).into());
-        }
-
-        let cell_count_offset = SQLITE_HEADER_LEN + 3;
-        let cell_count = u16::from_be_bytes([page[cell_count_offset], page[cell_count_offset + 1]]);
-
-        Ok(Self { cell_count })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{BTreePageHeader, DatabaseHeader, SQLITE_HEADER_LEN, SQLITE_MAGIC_HEADER};
+    use super::*;
 
     #[test]
     fn parses_database_page_size() {
@@ -127,12 +127,13 @@ mod tests {
 
     #[test]
     fn parses_page_one_cell_count() {
-        let mut page = vec![0_u8; SQLITE_HEADER_LEN + 8];
-        page[SQLITE_HEADER_LEN] = 0x0d;
+        let mut page = vec![0_u8; SQLITE_HEADER_LEN + 8 + (3 * 2)];
+        page[SQLITE_HEADER_LEN] = 13;
         page[SQLITE_HEADER_LEN + 3..SQLITE_HEADER_LEN + 5].copy_from_slice(&3_u16.to_be_bytes());
 
-        let parsed = BTreePageHeader::parse_page_one(&page).expect("page header should parse");
+        let parsed = BTreePage::parse_page_one(&page).expect("page header should parse");
 
+        assert_eq!(parsed.kind, BTreePageKind::TableLeaf);
         assert_eq!(parsed.cell_count, 3);
     }
 }
