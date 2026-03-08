@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::error::SqliteParseError;
-use crate::page::{BTreePage, BTreePageKind};
-use crate::schema_table::SchemaTable;
+use crate::page::{BTreeCell, BTreePage, BTreePageKind};
+use crate::record::Record;
+use crate::schema_table::{SchemaTable, SchemaTableEntry};
 
 const SQLITE_HEADER_LEN: usize = 100;
 const SQLITE_MAGIC_HEADER: &[u8; 16] = b"SQLite format 3\0";
@@ -61,17 +62,8 @@ impl SqliteDB {
         }
     }
 
-    pub fn schema_table(&self) -> &SchemaTable {
-        &self.schema_table
-    }
-
-    pub fn table_names(&self) -> Result<Vec<String>> {
-        Ok(self
-            .schema_table
-            .user_table_names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect())
+    pub fn table_names(&self) -> Vec<&str> {
+        self.schema_table.user_table_names()
     }
 
     pub fn read_page(&self, page_number: u32) -> Result<Vec<u8>> {
@@ -95,9 +87,38 @@ impl SqliteDB {
     }
 
     pub fn count_rows(&self, table_name: &str) -> Result<usize> {
+        let (_, _page, btree_page) = self.read_table_root_page(table_name)?;
+        Ok(usize::from(btree_page.cell_count))
+    }
+
+    pub fn select_column_values(&self, table_name: &str, column_name: &str) -> Result<Vec<String>> {
+        let (entry, page, btree_page) = self.read_table_root_page(table_name)?;
+        let column_index = entry.column_index(column_name)?;
+
+        btree_page
+            .cells(&page)?
+            .into_iter()
+            .map(|cell| match cell {
+                BTreeCell::TableLeaf(cell) => {
+                    let record = Record::parse(cell.payload)?;
+                    let column = record
+                        .column(column_index)
+                        .ok_or(SqliteParseError::RecordColumnOutOfBounds { column_index })?;
+                    column.decode_text(format!("{table_name}.{column_name}"))
+                }
+                _ => unreachable!("table root page must be a table leaf page"),
+            })
+            .collect()
+    }
+
+    fn read_table_root_page(
+        &self,
+        table_name: &str,
+    ) -> Result<(SchemaTableEntry, Vec<u8>, BTreePage)> {
         let entry = self
             .schema_table
             .find_table(table_name)
+            .cloned()
             .ok_or_else(|| SqliteParseError::TableNotFound(table_name.to_owned()))?;
         let rootpage = entry
             .rootpage
@@ -117,7 +138,7 @@ impl SqliteDB {
             });
         }
 
-        Ok(usize::from(btree_page.cell_count))
+        Ok((entry, page, btree_page))
     }
 }
 
@@ -205,7 +226,7 @@ mod tests {
         let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
 
         let apples = database
-            .schema_table()
+            .schema_table
             .find_table("apples")
             .expect("apples table should exist");
 
@@ -221,5 +242,60 @@ mod tests {
             .expect("apples row count should parse");
 
         assert_eq!(row_count, 4);
+    }
+
+    #[test]
+    fn selects_name_values_from_apples_table() {
+        let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
+
+        let mut values = database
+            .select_column_values("apples", "name")
+            .expect("apples names should parse");
+        values.sort();
+
+        assert_eq!(
+            values,
+            vec![
+                "Fuji".to_owned(),
+                "Golden Delicious".to_owned(),
+                "Granny Smith".to_owned(),
+                "Honeycrisp".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_table_error_matches_sqlite_shape() {
+        let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
+
+        let error = database.count_rows("missing_table").unwrap_err();
+        let error = error
+            .downcast_ref::<SqliteParseError>()
+            .expect("error should downcast to SqliteParseError");
+
+        assert!(matches!(
+            error,
+            SqliteParseError::TableNotFound(table_name) if table_name == "missing_table"
+        ));
+    }
+
+    #[test]
+    fn missing_column_error_matches_sqlite_shape() {
+        let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
+
+        let error = database
+            .select_column_values("apples", "missing_col")
+            .unwrap_err();
+        let error = error
+            .downcast_ref::<SqliteParseError>()
+            .expect("error should downcast to SqliteParseError");
+
+        assert!(matches!(
+            error,
+            SqliteParseError::ColumnNotFound {
+                table_name,
+                column_name,
+            } if table_name == "apples" && column_name == "missing_col"
+        ));
     }
 }

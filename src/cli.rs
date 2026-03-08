@@ -5,6 +5,8 @@ use anyhow::Result;
 use clap::Parser;
 use strum::EnumString;
 
+use crate::query::SqlStatement;
+
 #[derive(Debug, Parser)]
 pub struct Cli {
     pub database_path: PathBuf,
@@ -13,13 +15,12 @@ pub struct Cli {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UserInput {
-    DbInfo,
-    Tables,
-    CountRows { table_name: String },
+    Dot(DotCommand),
+    Sql(SqlStatement),
 }
 
 #[derive(Clone, Debug, EnumString, PartialEq, Eq)]
-enum DotCommand {
+pub enum DotCommand {
     #[strum(serialize = ".dbinfo")]
     DbInfo,
     #[strum(serialize = ".tables")]
@@ -35,16 +36,46 @@ impl Cli {
 impl UserInput {
     pub fn parse(input: &str) -> Result<Self> {
         match DotCommand::from_str(input) {
-            Ok(DotCommand::DbInfo) => Ok(Self::DbInfo),
-            Ok(DotCommand::Tables) => Ok(Self::Tables),
-            Err(_) => Self::parse_sql(input),
+            Ok(dot_command) => Ok(Self::Dot(dot_command)),
+            Err(_) => Ok(Self::Sql(SqlStatement::parse(input)?)),
         }
     }
+}
 
-    fn parse_sql(input: &str) -> Result<Self> {
-        let tokens: Vec<&str> = input.split_ascii_whitespace().collect();
-        Ok(Self::CountRows {
-            table_name: tokens[3].to_owned(),
-        })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_dot_commands() {
+        assert_eq!(
+            UserInput::parse(".dbinfo").unwrap(),
+            UserInput::Dot(DotCommand::DbInfo)
+        );
+        assert_eq!(
+            UserInput::parse(".tables").unwrap(),
+            UserInput::Dot(DotCommand::Tables)
+        );
+    }
+
+    #[test]
+    fn parses_count_query() {
+        assert_eq!(
+            UserInput::parse("SELECT COUNT(*) FROM apples").unwrap(),
+            UserInput::Sql(SqlStatement::SelectCount {
+                table_name: "apples".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_column_query() {
+        assert_eq!(
+            UserInput::parse("SELECT name FROM apples").unwrap(),
+            UserInput::Sql(SqlStatement::SelectColumn {
+                table_name: "apples".to_owned(),
+                column_name: "name".to_owned(),
+            })
+        );
     }
 }

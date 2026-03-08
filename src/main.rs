@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 
-use sqlite_rust::cli::{Cli, UserInput};
+use sqlite_rust::cli::{Cli, DotCommand, UserInput};
+use sqlite_rust::query::SqlStatement;
 use sqlite_rust::db::SqliteDB;
 
 fn main() -> Result<()> {
@@ -9,16 +10,27 @@ fn main() -> Result<()> {
     let database = SqliteDB::open(&cli.database_path)?;
 
     match cli.user_input()? {
-        UserInput::DbInfo => {
+        UserInput::Dot(DotCommand::DbInfo) => {
             let info = database.db_info();
             println!("database page size: {}", info.page_size);
             println!("number of tables: {}", info.table_count);
         }
-        UserInput::Tables => {
-            println!("{}", database.table_names()?.join(" "));
+        UserInput::Dot(DotCommand::Tables) => {
+            println!("{}", database.table_names().join(" "));
         }
-        UserInput::CountRows { table_name } => {
+        UserInput::Sql(SqlStatement::SelectCount { table_name }) => {
             println!("{}", database.count_rows(&table_name)?);
+        }
+        UserInput::Sql(SqlStatement::SelectColumn {
+            table_name,
+            column_name,
+        }) => {
+            println!(
+                "{}",
+                database
+                    .select_column_values(&table_name, &column_name)?
+                    .join("\n")
+            );
         }
     }
 
