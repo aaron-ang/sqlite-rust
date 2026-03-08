@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -81,7 +82,6 @@ impl<'a> ResolvedColumn<'a> {
 pub struct SqliteDB {
     path: PathBuf,
     header: DatabaseHeader,
-    schema_page: BTreePage,
     schema_table: SchemaTable,
 }
 
@@ -95,25 +95,11 @@ impl SqliteDB {
             .context("failed to read SQLite database header")?;
 
         let header = DatabaseHeader::parse(&header_bytes)?;
-
-        let mut page_one = vec![0_u8; header.page_size as usize];
-        page_one[..SQLITE_HEADER_LEN].copy_from_slice(&header_bytes);
-        file.read_exact(&mut page_one[SQLITE_HEADER_LEN..])
-            .context("failed to read SQLite page 1")?;
-
-        let schema_page = BTreePage::parse_page_one(&page_one)?;
-        if schema_page.kind != BTreePageKind::TableLeaf {
-            bail!(SqliteParseError::UnsupportedPageType(
-                page_one[SQLITE_HEADER_LEN]
-            ));
-        }
-
-        let schema_table = SchemaTable::parse(&page_one, &schema_page)?;
+        let schema_table = load_schema_table(path, &header)?;
 
         Ok(Self {
             path: path.to_path_buf(),
             header,
-            schema_page,
             schema_table,
         })
     }
@@ -121,7 +107,7 @@ impl SqliteDB {
     pub fn db_info(&self) -> DbInfo {
         DbInfo {
             page_size: self.header.page_size,
-            table_count: self.schema_page.cell_count,
+            table_count: self.schema_table.table_count(),
         }
     }
 
@@ -130,23 +116,7 @@ impl SqliteDB {
     }
 
     pub fn read_page(&self, page_number: u32) -> Result<Vec<u8>> {
-        if page_number == 0 {
-            bail!(SqliteParseError::InvalidPageNumber);
-        }
-
-        let mut file = File::open(&self.path)
-            .with_context(|| format!("failed to open {}", self.path.display()))?;
-        let page_size = self.header.page_size as usize;
-        let file_offset = u64::from(page_number - 1) * u64::from(self.header.page_size);
-
-        file.seek(SeekFrom::Start(file_offset))
-            .with_context(|| format!("failed to seek to page {page_number}"))?;
-
-        let mut page = vec![0_u8; page_size];
-        file.read_exact(&mut page)
-            .with_context(|| format!("failed to read page {page_number}"))?;
-
-        Ok(page)
+        read_page_from_path(&self.path, self.header.page_size, page_number)
     }
 
     pub fn count_rows(&self, table_name: &str) -> Result<usize> {
@@ -302,14 +272,26 @@ impl SqliteDB {
     }
 
     pub(crate) fn read_btree_page(&self, page_number: u32) -> Result<(Vec<u8>, BTreePage)> {
-        let page = self.read_page(page_number)?;
-        let header_offset = if page_number == 1 {
-            SQLITE_HEADER_LEN
-        } else {
-            0
-        };
-        let btree_page = BTreePage::parse(&page, header_offset)?;
-        Ok((page, btree_page))
+        read_btree_page_from_path(&self.path, &self.header, page_number)
+    }
+
+    pub(crate) fn usable_page_size(&self) -> usize {
+        self.header.usable_page_size()
+    }
+
+    pub(crate) fn read_full_payload<'a>(
+        &self,
+        payload_size: u64,
+        local_payload: &'a [u8],
+        overflow_page: Option<u32>,
+    ) -> Result<Cow<'a, [u8]>> {
+        read_full_payload_from_path(
+            &self.path,
+            &self.header,
+            payload_size,
+            local_payload,
+            overflow_page,
+        )
     }
 
     fn resolve_table_root(&self, table_name: &str) -> Result<(&SchemaTableEntry, u32)> {
@@ -331,12 +313,13 @@ impl SqliteDB {
 #[derive(Debug)]
 pub struct DbInfo {
     pub page_size: u32,
-    pub table_count: u16,
+    pub table_count: usize,
 }
 
 #[derive(Debug)]
 struct DatabaseHeader {
     page_size: u32,
+    reserved_bytes_per_page: u8,
 }
 
 impl DatabaseHeader {
@@ -351,17 +334,162 @@ impl DatabaseHeader {
             512..=32_768 if raw_page_size.is_power_of_two() => raw_page_size as u32,
             other => bail!(SqliteParseError::InvalidPageSize(other)),
         };
+        let reserved_bytes_per_page = bytes[20];
 
-        Ok(Self { page_size })
+        Ok(Self {
+            page_size,
+            reserved_bytes_per_page,
+        })
     }
+
+    fn usable_page_size(&self) -> usize {
+        self.page_size as usize - usize::from(self.reserved_bytes_per_page)
+    }
+}
+
+fn load_schema_table(path: &Path, header: &DatabaseHeader) -> Result<SchemaTable> {
+    let mut pages_to_visit = vec![1_u32];
+    let mut entries = Vec::new();
+
+    while let Some(page_number) = pages_to_visit.pop() {
+        let (page_bytes, btree_page) = read_btree_page_from_path(path, header, page_number)?;
+
+        match btree_page.kind {
+            BTreePageKind::TableLeaf => {
+                for cell in btree_page.cells(&page_bytes, header.usable_page_size())? {
+                    let crate::page::BTreeCell::TableLeaf(cell) = cell else {
+                        unreachable!("schema leaf page should only contain table leaf cells");
+                    };
+                    let payload = read_full_payload_from_path(
+                        path,
+                        header,
+                        cell.payload_size.value(),
+                        cell.payload,
+                        cell.overflow_page,
+                    )?;
+                    entries.push(SchemaTableEntry::parse_record_payload(payload.as_ref())?);
+                }
+            }
+            BTreePageKind::TableInterior => {
+                if let Some(right_most_ptr) = btree_page.right_most_ptr {
+                    pages_to_visit.push(right_most_ptr);
+                }
+
+                for cell in btree_page
+                    .cells(&page_bytes, header.usable_page_size())?
+                    .into_iter()
+                    .rev()
+                {
+                    let crate::page::BTreeCell::TableInterior(cell) = cell else {
+                        unreachable!(
+                            "schema interior page should only contain table interior cells"
+                        );
+                    };
+                    pages_to_visit.push(cell.left_child_ptr);
+                }
+            }
+            _ => {
+                let page_type = page_bytes
+                    .get(btree_page.header_offset)
+                    .copied()
+                    .unwrap_or_default();
+                bail!(SqliteParseError::UnsupportedRootPageType {
+                    object_type: "table",
+                    object_name: "sqlite_schema".to_owned(),
+                    page_type,
+                });
+            }
+        }
+    }
+
+    Ok(SchemaTable::from_entries(entries))
+}
+
+fn read_page_from_path(path: &Path, page_size: u32, page_number: u32) -> Result<Vec<u8>> {
+    if page_number == 0 {
+        bail!(SqliteParseError::InvalidPageNumber);
+    }
+
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let page_size = page_size as usize;
+    let file_offset = u64::from(page_number - 1) * u64::from(page_size as u32);
+
+    file.seek(SeekFrom::Start(file_offset))
+        .with_context(|| format!("failed to seek to page {page_number}"))?;
+
+    let mut page = vec![0_u8; page_size];
+    file.read_exact(&mut page)
+        .with_context(|| format!("failed to read page {page_number}"))?;
+
+    Ok(page)
+}
+
+fn read_btree_page_from_path(
+    path: &Path,
+    header: &DatabaseHeader,
+    page_number: u32,
+) -> Result<(Vec<u8>, BTreePage)> {
+    let page = read_page_from_path(path, header.page_size, page_number)?;
+    let header_offset = if page_number == 1 {
+        SQLITE_HEADER_LEN
+    } else {
+        0
+    };
+    let btree_page = BTreePage::parse(&page, header_offset)?;
+    Ok((page, btree_page))
+}
+
+fn read_full_payload_from_path<'a>(
+    path: &Path,
+    header: &DatabaseHeader,
+    payload_size: u64,
+    local_payload: &'a [u8],
+    overflow_page: Option<u32>,
+) -> Result<Cow<'a, [u8]>> {
+    let payload_size = usize::try_from(payload_size)
+        .map_err(|_| SqliteParseError::InvalidPayloadSize(payload_size))?;
+    if overflow_page.is_none() || payload_size <= local_payload.len() {
+        return Ok(Cow::Borrowed(local_payload));
+    }
+
+    let mut full_payload = Vec::with_capacity(payload_size);
+    full_payload.extend_from_slice(local_payload);
+
+    let mut next_page = overflow_page;
+    let overflow_chunk_size = header.usable_page_size() - size_of::<u32>();
+
+    while full_payload.len() < payload_size {
+        let page_number = next_page.ok_or(SqliteParseError::TruncatedOverflowChain)?;
+        let page = read_page_from_path(path, header.page_size, page_number)?;
+
+        let (next, _chunk) = page
+            .split_first_chunk::<4>()
+            .ok_or(SqliteParseError::TruncatedOverflowChain)?;
+        next_page = match u32::from_be_bytes(*next) {
+            0 => None,
+            page_number => Some(page_number),
+        };
+
+        let remaining = payload_size - full_payload.len();
+        let chunk_len = remaining.min(overflow_chunk_size);
+        let chunk_end = size_of::<u32>() + chunk_len;
+        full_payload.extend_from_slice(
+            page.get(size_of::<u32>()..chunk_end)
+                .ok_or(SqliteParseError::TruncatedOverflowChain)?,
+        );
+    }
+
+    Ok(Cow::Owned(full_payload))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn sample_db_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("sample_clone.db")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("sample.db")
     }
 
     fn superheroes_db_path() -> PathBuf {
@@ -370,6 +498,85 @@ mod tests {
 
     fn companies_db_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("companies.db")
+    }
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sqlite-rust-{name}-{unique}.db"))
+    }
+
+    fn build_header(page_size: u16) -> [u8; SQLITE_HEADER_LEN] {
+        let mut header = [0_u8; SQLITE_HEADER_LEN];
+        header[..SQLITE_MAGIC_HEADER.len()].copy_from_slice(SQLITE_MAGIC_HEADER);
+        header[16..18].copy_from_slice(&page_size.to_be_bytes());
+        header
+    }
+
+    fn encode_text_serial_type(len: usize) -> u8 {
+        ((len * 2) + 13) as u8
+    }
+
+    fn build_schema_record(
+        object_type: &str,
+        name: &str,
+        table_name: &str,
+        rootpage: u8,
+        sql: &str,
+    ) -> Vec<u8> {
+        let header_size = 6_u8;
+        let mut payload = vec![
+            header_size,
+            encode_text_serial_type(object_type.len()),
+            encode_text_serial_type(name.len()),
+            encode_text_serial_type(table_name.len()),
+            1,
+            encode_text_serial_type(sql.len()),
+        ];
+        payload.extend_from_slice(object_type.as_bytes());
+        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(table_name.as_bytes());
+        payload.push(rootpage);
+        payload.extend_from_slice(sql.as_bytes());
+        payload
+    }
+
+    fn build_table_leaf_page(cell_rowid: u8, payload: &[u8]) -> Vec<u8> {
+        let page_size = 512;
+        let cell_len = 2 + payload.len();
+        let cell_offset = page_size - cell_len;
+        let mut page = vec![0_u8; page_size];
+        page[0] = BTreePageKind::TableLeaf as u8;
+        page[3..5].copy_from_slice(&1_u16.to_be_bytes());
+        page[5..7].copy_from_slice(&(cell_offset as u16).to_be_bytes());
+        page[8..10].copy_from_slice(&(cell_offset as u16).to_be_bytes());
+        page[cell_offset] = payload.len() as u8;
+        page[cell_offset + 1] = cell_rowid;
+        page[cell_offset + 2..cell_offset + 2 + payload.len()].copy_from_slice(payload);
+        page
+    }
+
+    fn build_schema_root_page(left_child_ptr: u32, right_most_ptr: u32) -> Vec<u8> {
+        let page_size = 512;
+        let cell_offset = page_size - 5;
+        let mut page = vec![0_u8; page_size];
+        let header = build_header(page_size as u16);
+        page[..SQLITE_HEADER_LEN].copy_from_slice(&header);
+
+        let header_offset = SQLITE_HEADER_LEN;
+        page[header_offset] = BTreePageKind::TableInterior as u8;
+        page[header_offset + 3..header_offset + 5].copy_from_slice(&1_u16.to_be_bytes());
+        page[header_offset + 5..header_offset + 7]
+            .copy_from_slice(&(cell_offset as u16).to_be_bytes());
+        page[header_offset + 8..header_offset + 12].copy_from_slice(&right_most_ptr.to_be_bytes());
+        page[header_offset + 12..header_offset + 14]
+            .copy_from_slice(&(cell_offset as u16).to_be_bytes());
+
+        page[cell_offset..cell_offset + 4].copy_from_slice(&left_child_ptr.to_be_bytes());
+        page[cell_offset + 4] = 1;
+        page
     }
 
     #[test]
@@ -395,6 +602,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_reserved_bytes_and_usable_page_size() {
+        let mut header = build_header(4096);
+        header[20] = 32;
+
+        let parsed = DatabaseHeader::parse(&header).expect("header should parse");
+
+        assert_eq!(parsed.page_size, 4096);
+        assert_eq!(parsed.reserved_bytes_per_page, 32);
+        assert_eq!(parsed.usable_page_size(), 4064);
+    }
+
+    #[test]
     fn parses_page_one_cell_count() {
         let mut page = vec![0_u8; SQLITE_HEADER_LEN + 8 + (3 * 2)];
         page[SQLITE_HEADER_LEN] = 13;
@@ -404,6 +623,115 @@ mod tests {
 
         assert_eq!(parsed.kind, BTreePageKind::TableLeaf);
         assert_eq!(parsed.cell_count, 3);
+    }
+
+    #[test]
+    fn reconstructs_payload_from_overflow_pages() {
+        let path = temp_db_path("overflow-payload");
+        let header = DatabaseHeader {
+            page_size: 512,
+            reserved_bytes_per_page: 0,
+        };
+        let mut bytes = vec![0_u8; 1024];
+        let local_payload = b"local";
+        let overflow_bytes = b"-overflow";
+        let overflow_page_offset = 512;
+        bytes[overflow_page_offset..overflow_page_offset + 4].copy_from_slice(&0_u32.to_be_bytes());
+        bytes[overflow_page_offset + 4..overflow_page_offset + 4 + overflow_bytes.len()]
+            .copy_from_slice(overflow_bytes);
+        fs::write(&path, bytes).expect("temp db should be writable");
+
+        let payload = read_full_payload_from_path(
+            &path,
+            &header,
+            (local_payload.len() + overflow_bytes.len()) as u64,
+            local_payload,
+            Some(2),
+        )
+        .expect("overflow payload should reconstruct");
+
+        assert_eq!(payload.as_ref(), b"local-overflow");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_record_from_reconstructed_overflow_payload() {
+        let path = temp_db_path("overflow-record");
+        let header = DatabaseHeader {
+            page_size: 512,
+            reserved_bytes_per_page: 0,
+        };
+        let text = "x".repeat(500);
+        let mut record_payload = vec![3, 0x87, 0x75];
+        record_payload.extend_from_slice(text.as_bytes());
+
+        let local_len = 39;
+        let local_payload = &record_payload[..local_len];
+        let overflow_payload = &record_payload[local_len..];
+        let mut bytes = vec![0_u8; 1024];
+        let overflow_page_offset = 512;
+        bytes[overflow_page_offset..overflow_page_offset + 4].copy_from_slice(&0_u32.to_be_bytes());
+        bytes[overflow_page_offset + 4..overflow_page_offset + 4 + overflow_payload.len()]
+            .copy_from_slice(overflow_payload);
+        fs::write(&path, bytes).expect("temp db should be writable");
+
+        let payload = read_full_payload_from_path(
+            &path,
+            &header,
+            record_payload.len() as u64,
+            local_payload,
+            Some(2),
+        )
+        .expect("overflow payload should reconstruct");
+        let record = Record::parse(payload.as_ref()).expect("record should parse");
+
+        assert_eq!(
+            record
+                .column(0)
+                .expect("record should have first column")
+                .decode_text("payload.text")
+                .expect("column should decode"),
+            text
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn loads_schema_table_from_multiple_pages() {
+        let path = temp_db_path("schema-multipage");
+        let apples = build_schema_record(
+            "table",
+            "apples",
+            "apples",
+            2,
+            "CREATE TABLE apples (id integer)",
+        );
+        let oranges = build_schema_record(
+            "table",
+            "oranges",
+            "oranges",
+            3,
+            "CREATE TABLE oranges (id integer)",
+        );
+
+        let mut bytes = build_schema_root_page(2, 3);
+        bytes.extend_from_slice(&build_table_leaf_page(1, &apples));
+        bytes.extend_from_slice(&build_table_leaf_page(2, &oranges));
+        fs::write(&path, bytes).expect("temp db should be writable");
+
+        let header = DatabaseHeader {
+            page_size: 512,
+            reserved_bytes_per_page: 0,
+        };
+        let schema = load_schema_table(&path, &header).expect("schema should load");
+
+        assert_eq!(schema.table_count(), 2);
+        assert!(schema.find_table("apples").is_some());
+        assert!(schema.find_table("oranges").is_some());
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

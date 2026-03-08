@@ -14,39 +14,58 @@ struct IndexKey<'a> {
 }
 
 impl<'a> IndexKey<'a> {
-    fn cmp_index_value(&self, target: &str) -> Ordering {
+    fn cmp_upper_probe(&self, target: &str) -> Ordering {
         match self.indexed_value {
             Some(value) => value.cmp(target),
             None => Ordering::Less,
         }
-    }
-
-    fn cmp_lower_probe(&self, target: &str) -> Ordering {
-        self.cmp_index_value(target)
-            .then_with(|| self.rowid.cmp(&u64::MAX))
-    }
-
-    fn cmp_upper_probe(&self, target: &str) -> Ordering {
-        self.cmp_index_value(target)
-            .then_with(|| self.rowid.cmp(&0))
+        .then_with(|| self.rowid.cmp(&0))
     }
 }
 
 #[derive(Debug)]
-struct ChildRange<'a> {
-    lower_exclusive: Option<IndexKey<'a>>,
-    upper_exclusive: Option<IndexKey<'a>>,
+struct PersistedIndexKey {
+    indexed_value: Option<String>,
+    rowid: u64,
 }
 
-impl<'a> ChildRange<'a> {
-    fn between(lower_exclusive: Option<IndexKey<'a>>, upper_exclusive: IndexKey<'a>) -> Self {
+impl PersistedIndexKey {
+    fn cmp_lower_probe(&self, target: &str) -> Ordering {
+        match self.indexed_value.as_deref() {
+            Some(value) => value.cmp(target),
+            None => Ordering::Less,
+        }
+        .then_with(|| self.rowid.cmp(&u64::MAX))
+    }
+}
+
+impl<'a> From<IndexKey<'a>> for PersistedIndexKey {
+    fn from(key: IndexKey<'a>) -> Self {
+        PersistedIndexKey {
+            indexed_value: key.indexed_value.map(str::to_owned),
+            rowid: key.rowid,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ChildRange<'a, 'b> {
+    lower_exclusive: Option<&'a PersistedIndexKey>,
+    upper_exclusive: Option<IndexKey<'b>>,
+}
+
+impl<'a, 'b> ChildRange<'a, 'b> {
+    fn between(
+        lower_exclusive: Option<&'a PersistedIndexKey>,
+        upper_exclusive: IndexKey<'b>,
+    ) -> Self {
         Self {
             lower_exclusive,
             upper_exclusive: Some(upper_exclusive),
         }
     }
 
-    fn right_of(lower_exclusive: Option<IndexKey<'a>>) -> Self {
+    fn right_of(lower_exclusive: Option<&'a PersistedIndexKey>) -> Self {
         Self {
             lower_exclusive,
             upper_exclusive: None,
@@ -84,6 +103,7 @@ impl<'a> IndexScanner<'a> {
         F: FnMut(u64) -> Result<()>,
     {
         let mut pages_to_visit = vec![root_page];
+        let usable_page_size = self.db.usable_page_size();
 
         while let Some(page_number) = pages_to_visit.pop() {
             let (page_bytes, btree_page) = self.db.read_btree_page(page_number)?;
@@ -91,7 +111,7 @@ impl<'a> IndexScanner<'a> {
             match btree_page.kind {
                 BTreePageKind::IndexLeaf => {
                     btree_page
-                        .cells(&page_bytes)?
+                        .cells(&page_bytes, usable_page_size)?
                         .into_iter()
                         .try_for_each(|cell| {
                             let BTreeCell::IndexLeaf(cell) = cell else {
@@ -99,7 +119,12 @@ impl<'a> IndexScanner<'a> {
                                     "index leaf page should only contain index leaf cells"
                                 );
                             };
-                            let key = parse_index_key(cell.payload, index_name)?;
+                            let payload = self.db.read_full_payload(
+                                cell.payload_size.value(),
+                                cell.payload,
+                                cell.overflow_page,
+                            )?;
+                            let key = parse_index_key(payload.as_ref(), index_name)?;
                             if key.indexed_value == Some(target) {
                                 visitor(key.rowid)?;
                             }
@@ -107,10 +132,10 @@ impl<'a> IndexScanner<'a> {
                         })?;
                 }
                 BTreePageKind::IndexInterior => {
-                    let mut lower_exclusive: Option<IndexKey> = None;
+                    let mut lower_exclusive: Option<PersistedIndexKey> = None;
 
                     btree_page
-                        .cells(&page_bytes)?
+                        .cells(&page_bytes, usable_page_size)?
                         .into_iter()
                         .try_for_each(|cell| {
                             let BTreeCell::IndexInterior(cell) = cell else {
@@ -118,19 +143,24 @@ impl<'a> IndexScanner<'a> {
                                     "index interior page should only contain index interior cells"
                                 );
                             };
-                            let key = parse_index_key(cell.payload, index_name)?;
+                            let payload = self.db.read_full_payload(
+                                cell.payload_size.value(),
+                                cell.payload,
+                                cell.overflow_page,
+                            )?;
+                            let key = parse_index_key(payload.as_ref(), index_name)?;
                             if key.indexed_value == Some(target) {
                                 visitor(key.rowid)?;
                             }
-                            if ChildRange::between(lower_exclusive, key).contains(target) {
+                            if ChildRange::between(lower_exclusive.as_ref(), key).contains(target) {
                                 pages_to_visit.push(cell.left_child_ptr);
                             }
-                            lower_exclusive = Some(key);
+                            lower_exclusive = Some(key.into());
                             Ok::<(), anyhow::Error>(())
                         })?;
 
                     if let Some(right_most_ptr) = btree_page.right_most_ptr
-                        && ChildRange::right_of(lower_exclusive).contains(target)
+                        && ChildRange::right_of(lower_exclusive.as_ref()).contains(target)
                     {
                         pages_to_visit.push(right_most_ptr);
                     }
@@ -185,11 +215,12 @@ mod tests {
 
     #[test]
     fn child_range_contains_target_inside_bounds() {
+        let lower = PersistedIndexKey {
+            indexed_value: Some("alpha".to_owned()),
+            rowid: 10,
+        };
         let range = ChildRange::between(
-            Some(IndexKey {
-                indexed_value: Some("alpha"),
-                rowid: 10,
-            }),
+            Some(&lower),
             IndexKey {
                 indexed_value: Some("gamma"),
                 rowid: 5,
@@ -201,10 +232,11 @@ mod tests {
 
     #[test]
     fn child_range_includes_exact_lower_value_for_equal_probe() {
-        let range = ChildRange::right_of(Some(IndexKey {
-            indexed_value: Some("eritrea"),
+        let lower = PersistedIndexKey {
+            indexed_value: Some("eritrea".to_owned()),
             rowid: 17,
-        }));
+        };
+        let range = ChildRange::right_of(Some(&lower));
 
         assert!(range.contains("eritrea"));
     }
@@ -236,16 +268,17 @@ mod tests {
             rowid: 1,
         };
 
-        assert_eq!(key.cmp_index_value("eritrea"), Ordering::Less);
+        assert_eq!(key.cmp_upper_probe("eritrea"), Ordering::Less);
     }
 
     #[test]
     fn eritrea_boundary_child_range_still_contains_target() {
+        let lower = PersistedIndexKey {
+            indexed_value: Some("egypt".to_owned()),
+            rowid: 99,
+        };
         let range = ChildRange::between(
-            Some(IndexKey {
-                indexed_value: Some("egypt"),
-                rowid: 99,
-            }),
+            Some(&lower),
             IndexKey {
                 indexed_value: Some("ethiopia"),
                 rowid: 1,

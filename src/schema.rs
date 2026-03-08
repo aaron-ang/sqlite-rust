@@ -10,7 +10,6 @@ use sqlparser::{
 use strum::EnumString;
 
 use crate::error::SqliteParseError;
-use crate::page::{BTreeCell, BTreePage, BTreePageKind};
 use crate::record::Record;
 
 const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
@@ -22,27 +21,19 @@ pub struct SchemaTable {
 }
 
 impl SchemaTable {
-    pub fn parse(page: &[u8], btree_page: &BTreePage) -> Result<Self> {
-        if btree_page.kind != BTreePageKind::TableLeaf {
-            bail!(SqliteParseError::UnsupportedPageType(
-                page[btree_page.header_offset]
-            ));
-        }
-
-        let entries = btree_page
-            .cells(page)?
-            .into_iter()
-            .map(|cell| match cell {
-                BTreeCell::TableLeaf(cell) => SchemaTableEntry::parse_record(cell.payload),
-                _ => unreachable!("schema table must be stored on a table leaf b-tree page"),
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self { entries })
+    pub fn from_entries(entries: Vec<SchemaTableEntry>) -> Self {
+        Self { entries }
     }
 
     pub fn entries(&self) -> &[SchemaTableEntry] {
         &self.entries
+    }
+
+    pub fn table_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.object_type == SchemaObjectType::Table)
+            .count()
     }
 
     pub fn user_table_names(&self) -> Vec<&str> {
@@ -219,7 +210,7 @@ impl SchemaTableEntry {
         Ok(create_index)
     }
 
-    fn parse_record(payload: &[u8]) -> Result<Self> {
+    pub(crate) fn parse_record_payload(payload: &[u8]) -> Result<Self> {
         let record = Record::parse(payload)?;
         let columns = record.columns();
         if columns.len() != 5 {
@@ -377,5 +368,29 @@ mod tests {
         };
 
         assert_eq!(entry.indexed_column_name().unwrap(), Some("country"));
+    }
+
+    #[test]
+    fn counts_only_schema_tables() {
+        let schema = SchemaTable::from_entries(vec![
+            SchemaTableEntry {
+                object_type: SchemaObjectType::Table,
+                name: "apples".to_owned(),
+                table_name: "apples".to_owned(),
+                rootpage: Some(2),
+                sql: Some("CREATE TABLE apples (id integer)".to_owned()),
+                metadata: OnceLock::new(),
+            },
+            SchemaTableEntry {
+                object_type: SchemaObjectType::Index,
+                name: "idx_apples_id".to_owned(),
+                table_name: "apples".to_owned(),
+                rootpage: Some(3),
+                sql: Some("CREATE INDEX idx_apples_id ON apples (id)".to_owned()),
+                metadata: OnceLock::new(),
+            },
+        ]);
+
+        assert_eq!(schema.table_count(), 1);
     }
 }

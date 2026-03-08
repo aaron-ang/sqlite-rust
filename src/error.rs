@@ -52,6 +52,8 @@ pub enum SqliteParseError {
     },
     #[error("record column index {column_index} is out of bounds")]
     RecordColumnOutOfBounds { column_index: usize },
+    #[error("invalid cell payload size: {0}")]
+    InvalidPayloadSize(u64),
     #[error("page number must be greater than zero")]
     InvalidPageNumber,
     #[error("{object_type} {object_name} root page has unsupported page type: 0x{page_type:02x}")]
@@ -68,4 +70,6 @@ pub enum SqliteParseError {
     CellPointerOutOfBounds(usize),
     #[error("cell payload at offset {offset} exceeds page bounds")]
     CellPayloadOutOfBounds { offset: usize },
+    #[error("overflow page chain ended before payload was fully read")]
+    TruncatedOverflowChain,
 }

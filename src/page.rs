@@ -10,6 +10,8 @@ const LEAF_BTREE_HEADER_SIZE: usize = 8;
 const INTERIOR_BTREE_HEADER_SIZE: usize = 12;
 const U16_BYTE_LEN: usize = size_of::<u16>();
 const U32_BYTE_LEN: usize = size_of::<u32>();
+const BTREE_PAYLOAD_FIXED_OVERHEAD: usize = 12;
+const TABLE_LEAF_MAX_LOCAL_PAYLOAD_OVERHEAD: usize = 35;
 
 #[derive(Debug, PartialEq)]
 pub enum Page {
@@ -85,14 +87,19 @@ impl BTreePage {
         Self::parse(page, PAGE_ONE_HEADER_OFFSET)
     }
 
-    pub fn cells<'a>(&self, page: &'a [u8]) -> Result<Vec<BTreeCell<'a>>> {
+    pub fn cells<'a>(&self, page: &'a [u8], usable_page_size: usize) -> Result<Vec<BTreeCell<'a>>> {
         self.cell_pointers
             .iter()
-            .map(|&cell_ptr| self.parse_cell(page, usize::from(cell_ptr)))
+            .map(|&cell_ptr| self.parse_cell(page, usize::from(cell_ptr), usable_page_size))
             .collect()
     }
 
-    pub fn parse_cell<'a>(&self, page: &'a [u8], cell_offset: usize) -> Result<BTreeCell<'a>> {
+    pub fn parse_cell<'a>(
+        &self,
+        page: &'a [u8],
+        cell_offset: usize,
+        usable_page_size: usize,
+    ) -> Result<BTreeCell<'a>> {
         let cell = page
             .get(cell_offset..)
             .ok_or(SqliteParseError::CellPointerOutOfBounds(cell_offset))?;
@@ -102,13 +109,21 @@ impl BTreePage {
             BTreePageKind::TableLeaf => {
                 let payload_size = cursor.read_varint()?;
                 let rowid = cursor.read_varint()?;
-                let payload = cursor.remaining_payload(payload_size.value() as usize)?;
+                let payload_len = self
+                    .kind
+                    .local_payload_len(payload_size.value(), usable_page_size)?;
+                let payload = cursor.remaining_payload(payload_len)?;
+                let overflow_page = (usize::try_from(payload_size.value())
+                    .map_err(|_| SqliteParseError::InvalidPayloadSize(payload_size.value()))?
+                    > payload_len)
+                    .then(|| cursor.read_u32_be())
+                    .transpose()?;
 
                 Ok(BTreeCell::TableLeaf(TableLeafCell {
                     payload_size,
                     rowid,
                     payload,
-                    overflow_page: None,
+                    overflow_page,
                 }))
             }
             BTreePageKind::TableInterior => {
@@ -122,24 +137,40 @@ impl BTreePage {
             }
             BTreePageKind::IndexLeaf => {
                 let payload_size = cursor.read_varint()?;
-                let payload = cursor.remaining_payload(payload_size.value() as usize)?;
+                let payload_len = self
+                    .kind
+                    .local_payload_len(payload_size.value(), usable_page_size)?;
+                let payload = cursor.remaining_payload(payload_len)?;
+                let overflow_page = (usize::try_from(payload_size.value())
+                    .map_err(|_| SqliteParseError::InvalidPayloadSize(payload_size.value()))?
+                    > payload_len)
+                    .then(|| cursor.read_u32_be())
+                    .transpose()?;
 
                 Ok(BTreeCell::IndexLeaf(IndexLeafCell {
                     payload_size,
                     payload,
-                    overflow_page: None,
+                    overflow_page,
                 }))
             }
             BTreePageKind::IndexInterior => {
                 let left_child_ptr = cursor.read_u32_be()?;
                 let payload_size = cursor.read_varint()?;
-                let payload = cursor.remaining_payload(payload_size.value() as usize)?;
+                let payload_len = self
+                    .kind
+                    .local_payload_len(payload_size.value(), usable_page_size)?;
+                let payload = cursor.remaining_payload(payload_len)?;
+                let overflow_page = (usize::try_from(payload_size.value())
+                    .map_err(|_| SqliteParseError::InvalidPayloadSize(payload_size.value()))?
+                    > payload_len)
+                    .then(|| cursor.read_u32_be())
+                    .transpose()?;
 
                 Ok(BTreeCell::IndexInterior(IndexInteriorCell {
                     left_child_ptr,
                     payload_size,
                     payload,
-                    overflow_page: None,
+                    overflow_page,
                 }))
             }
         }
@@ -204,6 +235,32 @@ impl BTreePageKind {
             LEAF_BTREE_HEADER_SIZE
         }
     }
+
+    pub fn local_payload_len(self, payload_size: u64, usable_page_size: usize) -> Result<usize> {
+        let payload_size = usize::try_from(payload_size)
+            .map_err(|_| SqliteParseError::InvalidPayloadSize(payload_size))?;
+
+        let min_local = ((usable_page_size - BTREE_PAYLOAD_FIXED_OVERHEAD) * 32 / 255) - 23;
+        let max_local = match self {
+            BTreePageKind::TableLeaf => usable_page_size - TABLE_LEAF_MAX_LOCAL_PAYLOAD_OVERHEAD,
+            BTreePageKind::IndexLeaf | BTreePageKind::IndexInterior => {
+                ((usable_page_size - BTREE_PAYLOAD_FIXED_OVERHEAD) * 64 / 255) - 23
+            }
+            BTreePageKind::TableInterior => return Ok(0),
+        };
+
+        if payload_size <= max_local {
+            return Ok(payload_size);
+        }
+
+        let overflow_adjusted =
+            min_local + ((payload_size - min_local) % (usable_page_size - U32_BYTE_LEN));
+        if overflow_adjusted <= max_local {
+            Ok(overflow_adjusted)
+        } else {
+            Ok(min_local)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -266,5 +323,38 @@ impl<'a> CellCursor<'a> {
 
     fn absolute_offset(&self) -> usize {
         self.base_offset + self.offset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_small_table_leaf_payload_local() {
+        assert_eq!(
+            BTreePageKind::TableLeaf.local_payload_len(32, 512).unwrap(),
+            32
+        );
+    }
+
+    #[test]
+    fn computes_overflowing_table_leaf_local_payload() {
+        assert_eq!(
+            BTreePageKind::TableLeaf
+                .local_payload_len(500, 512)
+                .unwrap(),
+            39
+        );
+    }
+
+    #[test]
+    fn computes_overflowing_index_leaf_local_payload() {
+        assert_eq!(
+            BTreePageKind::IndexLeaf
+                .local_payload_len(500, 512)
+                .unwrap(),
+            39
+        );
     }
 }

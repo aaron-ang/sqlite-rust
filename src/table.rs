@@ -19,17 +19,23 @@ impl<'a> TableScanner<'a> {
         F: for<'record> FnMut(u64, Record<'record>) -> Result<()>,
     {
         let mut pages_to_visit = vec![root_page];
+        let usable_page_size = self.db.usable_page_size();
 
         while let Some(page_number) = pages_to_visit.pop() {
             let (page_bytes, btree_page) = self.db.read_btree_page(page_number)?;
 
             match btree_page.kind {
                 BTreePageKind::TableLeaf => {
-                    for cell in btree_page.cells(&page_bytes)? {
+                    for cell in btree_page.cells(&page_bytes, usable_page_size)? {
                         let BTreeCell::TableLeaf(cell) = cell else {
                             unreachable!("table leaf page should only contain table leaf cells");
                         };
-                        visitor(cell.rowid.value(), Record::parse(cell.payload)?)?;
+                        let payload = self.db.read_full_payload(
+                            cell.payload_size.value(),
+                            cell.payload,
+                            cell.overflow_page,
+                        )?;
+                        visitor(cell.rowid.value(), Record::parse(payload.as_ref())?)?;
                     }
                 }
                 BTreePageKind::TableInterior => {
@@ -37,7 +43,11 @@ impl<'a> TableScanner<'a> {
                         pages_to_visit.push(right_most_ptr);
                     }
 
-                    for cell in btree_page.cells(&page_bytes)?.into_iter().rev() {
+                    for cell in btree_page
+                        .cells(&page_bytes, usable_page_size)?
+                        .into_iter()
+                        .rev()
+                    {
                         let BTreeCell::TableInterior(cell) = cell else {
                             unreachable!(
                                 "table interior page should only contain table interior cells"
@@ -74,18 +84,24 @@ impl<'a> TableScanner<'a> {
         F: for<'record> FnMut(u64, Record<'record>) -> Result<()>,
     {
         let mut current_page = root_page;
+        let usable_page_size = self.db.usable_page_size();
 
         loop {
             let (page_bytes, btree_page) = self.db.read_btree_page(current_page)?;
 
             match btree_page.kind {
                 BTreePageKind::TableLeaf => {
-                    for cell in btree_page.cells(&page_bytes)? {
+                    for cell in btree_page.cells(&page_bytes, usable_page_size)? {
                         let BTreeCell::TableLeaf(cell) = cell else {
                             unreachable!("table leaf page should only contain table leaf cells");
                         };
                         if cell.rowid.value() == target_rowid {
-                            visitor(target_rowid, Record::parse(cell.payload)?)?;
+                            let payload = self.db.read_full_payload(
+                                cell.payload_size.value(),
+                                cell.payload,
+                                cell.overflow_page,
+                            )?;
+                            visitor(target_rowid, Record::parse(payload.as_ref())?)?;
                             return Ok(true);
                         }
                     }
@@ -104,7 +120,7 @@ impl<'a> TableScanner<'a> {
                         },
                     )?;
 
-                    for cell in btree_page.cells(&page_bytes)? {
+                    for cell in btree_page.cells(&page_bytes, usable_page_size)? {
                         let BTreeCell::TableInterior(cell) = cell else {
                             unreachable!(
                                 "table interior page should only contain table interior cells"
