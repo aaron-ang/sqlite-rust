@@ -65,7 +65,10 @@ pub enum SqliteParseError {
         page_type: u8,
     },
     #[error("in prepare, no usable index found for {table_name}.{column_name}")]
-    NoUsableIndex { table_name: String, column_name: String },
+    NoUsableIndex {
+        table_name: String,
+        column_name: String,
+    },
     #[error("malformed index entry in {index_name}")]
     MalformedIndexEntry { index_name: String },
     #[error("cell pointer {0} is out of bounds")]

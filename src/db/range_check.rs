@@ -50,4 +50,3 @@ pub fn record_satisfies_upper(
         _ => false,
     }
 }
-

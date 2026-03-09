@@ -2,8 +2,8 @@ use anyhow::{Result, bail};
 use bytes::Buf;
 use num_enum::TryFromPrimitive;
 
-use crate::error::SqliteParseError;
 use super::varint::SqliteVarint;
+use crate::error::SqliteParseError;
 
 const PAGE_ONE_HEADER_OFFSET: usize = 100;
 const LEAF_BTREE_HEADER_SIZE: usize = 8;

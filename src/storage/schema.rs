@@ -9,8 +9,8 @@ use sqlparser::{
 };
 use strum::EnumString;
 
-use crate::error::SqliteParseError;
 use super::record::Record;
+use crate::error::SqliteParseError;
 
 const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";

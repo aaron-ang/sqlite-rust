@@ -3,8 +3,8 @@ use std::str;
 use anyhow::{Result, bail};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-use crate::error::SqliteParseError;
 use super::varint::SqliteVarint;
+use crate::error::SqliteParseError;
 
 #[derive(Debug, PartialEq)]
 pub struct Record<'a> {

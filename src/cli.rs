@@ -13,13 +13,13 @@ pub struct Cli {
     #[arg(long = "cmd")]
     pub cmds: Vec<String>,
     pub database_path: PathBuf,
-    pub input: String,
+    pub input: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum UserInput {
     Dot(DotCommand),
-    Sql(SqlStatement),
+    Sql(Vec<SqlStatement>),
 }
 
 #[derive(Debug, EnumString, PartialEq)]
@@ -42,7 +42,12 @@ pub struct ShellConfig {
 
 impl Cli {
     pub fn user_input(&self) -> Result<UserInput> {
-        UserInput::parse(&self.input)
+        let input = self
+            .input
+            .as_deref()
+            .expect("user_input requires positional input");
+
+        UserInput::parse(input)
     }
 
     pub fn shell_config(&self) -> Result<ShellConfig> {
@@ -92,7 +97,16 @@ mod tests {
 
         assert!(cli.cmds.is_empty());
         assert_eq!(cli.database_path, PathBuf::from("sample.db"));
-        assert_eq!(cli.input, ".dbinfo");
+        assert_eq!(cli.input.as_deref(), Some(".dbinfo"));
+    }
+
+    #[test]
+    fn parses_without_positional_input() {
+        let cli = Cli::parse_from(["sqlite-rust", "sample.db"]);
+
+        assert!(cli.cmds.is_empty());
+        assert_eq!(cli.database_path, PathBuf::from("sample.db"));
+        assert_eq!(cli.input, None);
     }
 
     #[test]
@@ -155,4 +169,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_multiple_positional_sql_statements() {
+        assert_eq!(
+            UserInput::parse("SELECT COUNT(*) FROM apples; SELECT COUNT(*) FROM oranges;").unwrap(),
+            UserInput::Sql(vec![
+                SqlStatement::SelectCount {
+                    table_name: "apples".to_owned()
+                },
+                SqlStatement::SelectCount {
+                    table_name: "oranges".to_owned()
+                }
+            ])
+        );
+    }
 }

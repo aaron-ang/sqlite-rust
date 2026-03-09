@@ -1,9 +1,9 @@
 use anyhow::{Result, bail};
 
-use crate::db::SqliteDB;
-use crate::error::SqliteParseError;
 use super::page::{BTreeCell, BTreePageKind};
 use super::record::Record;
+use crate::db::SqliteDB;
+use crate::error::SqliteParseError;
 
 pub struct TableScanner<'a> {
     db: &'a SqliteDB,

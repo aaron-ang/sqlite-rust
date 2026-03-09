@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use sqlparser::ast::{
     BinaryOperator, Expr, Fetch, FunctionArg, FunctionArgExpr, FunctionArguments, LockClause,
     OrderBy, OrderByExpr, OrderByKind, Select, SelectItem, SetExpr, Statement, TableFactor, Top,
@@ -29,38 +29,38 @@ impl From<SqliteParseError> for QueryBuildError {
 }
 
 impl SqlStatement {
-    pub fn parse(sql: &str) -> Result<Self> {
+    pub fn parse(sql: &str) -> Result<Vec<Self>> {
         let dialect = SQLiteDialect {};
-        let mut statements = Parser::parse_sql(&dialect, sql).map_err(map_parser_error)?;
-
-        if statements.len() != 1 {
-            bail!(SqliteParseError::UnsupportedSql(sql.to_owned()));
-        }
-
-        let statement = statements.pop().expect("single statement must exist");
-        Self::parse_statement(statement).map_err(|error| match error {
-            QueryBuildError::Unsupported => SqliteParseError::UnsupportedSql(sql.to_owned()).into(),
-            QueryBuildError::Sqlite(error) => error.into(),
-        })
+        let statements = Parser::parse_sql(&dialect, sql).map_err(map_parser_error)?;
+        statements
+            .into_iter()
+            .map(|statement| {
+                Self::parse_statement(&statement).map_err(|error| match error {
+                    QueryBuildError::Unsupported => {
+                        SqliteParseError::UnsupportedSql(statement.to_string()).into()
+                    }
+                    QueryBuildError::Sqlite(error) => error.into(),
+                })
+            })
+            .collect()
     }
 
-    fn parse_statement(statement: Statement) -> ParseResult<Self> {
+    fn parse_statement(statement: &Statement) -> ParseResult<Self> {
         let Statement::Query(query) = statement else {
             return Err(QueryBuildError::Unsupported);
         };
 
-        Self::parse_select_query(*query)
+        Self::parse_select_query(query)
     }
 
-    fn parse_select_query(query: sqlparser::ast::Query) -> ParseResult<Self> {
-        validate_query(&query)?;
+    fn parse_select_query(query: &sqlparser::ast::Query) -> ParseResult<Self> {
+        validate_query(query)?;
 
-        let SetExpr::Select(select) = *query.body else {
+        let SetExpr::Select(select) = query.body.as_ref() else {
             return Err(QueryBuildError::Unsupported);
         };
-        let select = *select;
 
-        validate_select(&select)?;
+        validate_select(select)?;
 
         let table_name = parse_table_name(&select.from[0].relation, &select.from[0].joins)?;
         let where_clause = Disjunction::parse_expr_opt(select.selection.as_ref())?;
@@ -469,9 +469,19 @@ mod tests {
     fn parses_count_query() {
         assert_eq!(
             SqlStatement::parse("SELECT COUNT(*) FROM apples").unwrap(),
-            SqlStatement::SelectCount {
+            vec![SqlStatement::SelectCount {
                 table_name: "apples".to_owned(),
-            }
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_accepts_single_statement_without_semicolon() {
+        assert_eq!(
+            SqlStatement::parse("SELECT COUNT(*) FROM apples").unwrap(),
+            vec![SqlStatement::SelectCount {
+                table_name: "apples".to_owned(),
+            }]
         );
     }
 
@@ -479,12 +489,12 @@ mod tests {
     fn parses_single_column_query() {
         assert_eq!(
             SqlStatement::parse("SELECT name FROM apples").unwrap(),
-            SqlStatement::SelectColumns {
+            vec![SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
                 column_names: vec!["name".to_owned()],
                 where_clause: None,
                 order_by: vec![],
-            }
+            }]
         );
     }
 
@@ -492,12 +502,12 @@ mod tests {
     fn parses_multi_column_query() {
         assert_eq!(
             SqlStatement::parse("SELECT name, color FROM apples").unwrap(),
-            SqlStatement::SelectColumns {
+            vec![SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
                 column_names: vec!["name".to_owned(), "color".to_owned()],
                 where_clause: None,
                 order_by: vec![],
-            }
+            }]
         );
     }
 
@@ -506,7 +516,7 @@ mod tests {
         assert_eq!(
             SqlStatement::parse("SELECT id, name FROM apples WHERE color = 'Yellow' AND id = 4")
                 .unwrap(),
-            SqlStatement::SelectColumns {
+            vec![SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
                 column_names: vec!["id".to_owned(), "name".to_owned()],
                 where_clause: Some(Disjunction {
@@ -528,7 +538,7 @@ mod tests {
                     }],
                 }),
                 order_by: vec![],
-            }
+            }]
         );
     }
 
@@ -539,7 +549,7 @@ mod tests {
                 "SELECT id, name FROM apples WHERE color = 'Yellow' OR color = 'Red'"
             )
             .unwrap(),
-            SqlStatement::SelectColumns {
+            vec![SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
                 column_names: vec!["id".to_owned(), "name".to_owned()],
                 where_clause: Some(Disjunction {
@@ -563,7 +573,7 @@ mod tests {
                     ],
                 }),
                 order_by: vec![],
-            }
+            }]
         );
     }
 
@@ -574,7 +584,7 @@ mod tests {
                 "SELECT id, name FROM apples WHERE color = 'Yellow' AND id = 4 OR color = 'Red'"
             )
             .unwrap(),
-            SqlStatement::SelectColumns {
+            vec![SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
                 column_names: vec!["id".to_owned(), "name".to_owned()],
                 where_clause: Some(Disjunction {
@@ -606,7 +616,7 @@ mod tests {
                     ],
                 }),
                 order_by: vec![],
-            }
+            }]
         );
     }
 
@@ -614,7 +624,7 @@ mod tests {
     fn parses_range_where_operators() {
         assert_eq!(
             SqlStatement::parse("SELECT name FROM apples WHERE id >= 2 AND id < 4").unwrap(),
-            SqlStatement::SelectColumns {
+            vec![SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
                 column_names: vec!["name".to_owned()],
                 where_clause: Some(Disjunction {
@@ -636,7 +646,7 @@ mod tests {
                     }],
                 }),
                 order_by: vec![],
-            }
+            }]
         );
     }
 
@@ -644,7 +654,7 @@ mod tests {
     fn parses_between_predicate() {
         assert_eq!(
             SqlStatement::parse("SELECT name FROM apples WHERE id BETWEEN 2 AND 4").unwrap(),
-            SqlStatement::SelectColumns {
+            vec![SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
                 column_names: vec!["name".to_owned()],
                 where_clause: Some(Disjunction {
@@ -658,7 +668,7 @@ mod tests {
                     }],
                 }),
                 order_by: vec![],
-            }
+            }]
         );
     }
 
@@ -666,7 +676,7 @@ mod tests {
     fn parses_order_by_clause() {
         assert_eq!(
             SqlStatement::parse("SELECT id, name FROM apples ORDER BY name").unwrap(),
-            SqlStatement::SelectColumns {
+            vec![SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
                 column_names: vec!["id".to_owned(), "name".to_owned()],
                 where_clause: None,
@@ -674,7 +684,7 @@ mod tests {
                     column_name: "name".to_owned(),
                     direction: SortDirection::Asc,
                 }],
-            }
+            }]
         );
     }
 
@@ -683,7 +693,7 @@ mod tests {
         assert_eq!(
             SqlStatement::parse("SELECT id, name FROM apples ORDER BY color DESC, name DESC")
                 .unwrap(),
-            SqlStatement::SelectColumns {
+            vec![SqlStatement::SelectColumns {
                 table_name: "apples".to_owned(),
                 column_names: vec!["id".to_owned(), "name".to_owned()],
                 where_clause: None,
@@ -697,7 +707,7 @@ mod tests {
                         direction: SortDirection::Desc,
                     },
                 ],
-            }
+            }]
         );
     }
 
@@ -709,11 +719,7 @@ mod tests {
             .downcast_ref::<SqliteParseError>()
             .expect("error should downcast to SqliteParseError");
 
-        assert!(matches!(
-            error,
-            SqliteParseError::UnsupportedSql(sql)
-                if sql == "SELECT name FROM apples WHERE color != 'green'"
-        ));
+        assert!(matches!(error, SqliteParseError::UnsupportedSql(_)));
     }
 
     #[test]
@@ -867,5 +873,37 @@ mod tests {
             .expect("error should downcast to SqliteParseError");
 
         assert!(matches!(error, SqliteParseError::SqlSyntaxError));
+    }
+
+    #[test]
+    fn parse_ignores_comments_and_blank_lines() {
+        assert_eq!(
+            SqlStatement::parse(
+                "\n-- count apples\nSELECT COUNT(*) FROM apples;\n\n-- count oranges\nSELECT COUNT(*) FROM oranges;\n"
+            )
+            .unwrap(),
+            vec![
+                SqlStatement::SelectCount {
+                    table_name: "apples".to_owned(),
+                },
+                SqlStatement::SelectCount {
+                    table_name: "oranges".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_statement() {
+        let error =
+            SqlStatement::parse("SELECT name FROM apples; DELETE FROM apples;").unwrap_err();
+        let error = error
+            .downcast_ref::<SqliteParseError>()
+            .expect("error should downcast to SqliteParseError");
+
+        assert!(matches!(
+            error,
+            SqliteParseError::UnsupportedSql(sql) if sql == "DELETE FROM apples"
+        ));
     }
 }
