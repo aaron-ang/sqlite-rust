@@ -342,8 +342,9 @@ fn strip_nested(expr: &Expr) -> &Expr {
 fn map_parser_error(error: ParserError) -> anyhow::Error {
     match error {
         ParserError::RecursionLimitExceeded => SqliteParseError::SqlSyntaxError.into(),
-        ParserError::TokenizerError(message) => map_parser_message(&message),
-        ParserError::ParserError(message) => map_parser_message(&message),
+        ParserError::TokenizerError(message) | ParserError::ParserError(message) => {
+            map_parser_message(&message)
+        }
     }
 }
 

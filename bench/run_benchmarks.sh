@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# Benchmark sqlite3 vs sqlite-rust: run benchmark_queries.sql and report timings.
-# Builds the Rust binary in release mode, then runs each query with both engines.
-# Takes NUM_SAMPLES runs per query and reports the mean time.
-# Usage: ./bench/run_benchmarks.sh [path_to_repo_root]
+# Benchmark sqlite3 vs sqlite-rust (50 samples/query, mean). Usage: ./bench/run_benchmarks.sh [root]
 
 set -e
 NUM_SAMPLES=50
@@ -12,14 +9,10 @@ SQL_FILE="${SCRIPT_DIR}/benchmark_queries.sql"
 RUST_BIN="${ROOT}/target/release/sqlite-rust"
 cd "$ROOT"
 
-# Extract "real" seconds from a "Run Time: real X.XXX ..." line
 parse_real_time() {
   awk '/Run Time:/ { for(i=1;i<=NF;i++) if($i=="real") { print $(i+1); exit } }'
 }
 
-# Run query N times with given engine, output mean of "real" time in seconds.
-# Usage: run_samples_and_mean <engine> <db_path> <query>
-#   engine: "sqlite3" or path to sqlite-rust binary
 run_samples_and_mean() {
   local engine="$1"
   local db_path="$2"
@@ -39,7 +32,7 @@ run_samples_and_mean() {
   if [[ -z "$times" ]]; then
     echo "N/A"
   else
-    echo "$times" | awk '{ sum=0; n=0; for(i=1;i<=NF;i++) { sum+=$i; n++ } print (n>0 ? sum/n : "N/A") }'
+    echo "$times" | awk '{ sum=0; n=0; for(i=1;i<=NF;i++) { sum+=$i; n++ } if(n>0) printf "%.6f", sum/n; else print "N/A" }'
   fi
 }
 
@@ -55,7 +48,6 @@ if [[ ! -x "$RUST_BIN" ]]; then
   exit 1
 fi
 
-# Extract "db|SELECT ..." lines (db = sample | companies | superheroes)
 run_awk() {
   awk '
     /-- sample\.db \(/     { db="sample"; next }
@@ -78,11 +70,9 @@ while IFS='|' read -r db query; do
   echo ""
   echo "--- ${db}.db ---"
   echo "  $query"
-  # sqlite3 (mean of NUM_SAMPLES runs)
   printf "  sqlite3:     "
   sqlite3_mean=$(run_samples_and_mean "sqlite3" "$db_path" "$query")
   echo "mean ${sqlite3_mean}s (${NUM_SAMPLES} runs)"
-  # sqlite-rust (mean of NUM_SAMPLES runs)
   printf "  sqlite-rust: "
   rust_mean=$(run_samples_and_mean "$RUST_BIN" "$db_path" "$query")
   echo "mean ${rust_mean}s (${NUM_SAMPLES} runs)"

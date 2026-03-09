@@ -2,11 +2,11 @@ use std::cmp::Ordering;
 
 use anyhow::{Result, bail};
 
+use super::page::{BTreeCell, BTreePageKind};
+use super::record::{Record, RecordValue};
 use crate::db::SqliteDB;
 use crate::error::SqliteParseError;
 use crate::query::QueryValue;
-use super::page::{BTreeCell, BTreePageKind};
-use super::record::{Record, RecordValue};
 
 #[derive(Clone, Copy, Debug)]
 struct TextIndexKey<'a> {
@@ -99,6 +99,33 @@ impl<'a> IndexScanner<'a> {
         Self { db }
     }
 
+    pub fn count_entries(&self, index_name: &str, root_page: u32) -> Result<usize> {
+        self.db.count_btree_leaf_cells(
+            root_page,
+            BTreePageKind::IndexLeaf,
+            BTreePageKind::IndexInterior,
+            |db, page, bytes| {
+                let us = db.usable_page_size();
+                let mut out = vec![];
+                if let Some(r) = page.right_most_ptr {
+                    out.push(r);
+                }
+                for cell in page.cells(bytes, us)? {
+                    let BTreeCell::IndexInterior(c) = cell else {
+                        unreachable!("index interior has index interior cells");
+                    };
+                    out.push(c.left_child_ptr);
+                }
+                Ok(out)
+            },
+            |pt| SqliteParseError::UnsupportedRootPageType {
+                object_type: "index",
+                object_name: index_name.to_owned(),
+                page_type: pt,
+            },
+        )
+    }
+
     pub fn visit_matching_rowids<F>(
         &self,
         index_name: &str,
@@ -109,13 +136,28 @@ impl<'a> IndexScanner<'a> {
     where
         F: FnMut(u64) -> Result<()>,
     {
-        if let [QueryValue::Text(target)] = prefix_values {
-            return self.visit_text_matches(index_name, root_page, target, &mut visitor);
-        }
-        self.visit_prefix_matches(index_name, root_page, prefix_values, &mut visitor)
+        self.visit_matching_entries(index_name, root_page, prefix_values, |_, rowid| {
+            visitor(rowid)
+        })
     }
 
-    fn visit_text_matches<F>(
+    pub fn visit_matching_entries<F>(
+        &self,
+        index_name: &str,
+        root_page: u32,
+        prefix_values: &[QueryValue],
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[RecordValue<'_>], u64) -> Result<()>,
+    {
+        if let [QueryValue::Text(target)] = prefix_values {
+            return self.visit_text_matches_entries(index_name, root_page, target, &mut visitor);
+        }
+        self.visit_prefix_matches_entries(index_name, root_page, prefix_values, &mut visitor)
+    }
+
+    fn visit_text_matches_entries<F>(
         &self,
         index_name: &str,
         root_page: u32,
@@ -123,7 +165,7 @@ impl<'a> IndexScanner<'a> {
         visitor: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(u64) -> Result<()>,
+        F: FnMut(&[RecordValue<'_>], u64) -> Result<()>,
     {
         let mut pages_to_visit = vec![root_page];
         let usable_page_size = self.db.usable_page_size();
@@ -133,54 +175,52 @@ impl<'a> IndexScanner<'a> {
 
             match btree_page.kind {
                 BTreePageKind::IndexLeaf => {
-                    btree_page
-                        .cells(&page_bytes, usable_page_size)?
-                        .into_iter()
-                        .try_for_each(|cell| {
-                            let BTreeCell::IndexLeaf(cell) = cell else {
-                                unreachable!(
-                                    "index leaf page should only contain index leaf cells"
-                                );
-                            };
-                            let payload = self.db.read_full_payload(
-                                cell.payload_size.value(),
-                                cell.payload,
-                                cell.overflow_page,
-                            )?;
-                            let key = parse_text_index_key(payload.as_ref(), index_name)?;
-                            if key.indexed_value == Some(target) {
-                                visitor(key.rowid)?;
-                            }
-                            Ok::<(), anyhow::Error>(())
-                        })?;
+                    for cell in btree_page.cells(&page_bytes, usable_page_size)? {
+                        let BTreeCell::IndexLeaf(cell) = cell else {
+                            unreachable!("index leaf page should only contain index leaf cells");
+                        };
+                        let payload = self.db.read_full_payload(
+                            cell.payload_size.value(),
+                            cell.payload,
+                            cell.overflow_page,
+                        )?;
+                        let key = parse_text_index_key(payload.as_ref(), index_name)?;
+                        if key.indexed_value == Some(target) {
+                            let val = key
+                                .indexed_value
+                                .map(RecordValue::Text)
+                                .unwrap_or(RecordValue::Null);
+                            visitor(&[val], key.rowid)?;
+                        }
+                    }
                 }
                 BTreePageKind::IndexInterior => {
                     let mut lower_exclusive: Option<PersistedTextIndexKey> = None;
 
-                    btree_page
-                        .cells(&page_bytes, usable_page_size)?
-                        .into_iter()
-                        .try_for_each(|cell| {
-                            let BTreeCell::IndexInterior(cell) = cell else {
-                                unreachable!(
-                                    "index interior page should only contain index interior cells"
-                                );
-                            };
-                            let payload = self.db.read_full_payload(
-                                cell.payload_size.value(),
-                                cell.payload,
-                                cell.overflow_page,
-                            )?;
-                            let key = parse_text_index_key(payload.as_ref(), index_name)?;
-                            if key.indexed_value == Some(target) {
-                                visitor(key.rowid)?;
-                            }
-                            if ChildRange::between(lower_exclusive.as_ref(), key).contains(target) {
-                                pages_to_visit.push(cell.left_child_ptr);
-                            }
-                            lower_exclusive = Some(key.into());
-                            Ok::<(), anyhow::Error>(())
-                        })?;
+                    for cell in btree_page.cells(&page_bytes, usable_page_size)? {
+                        let BTreeCell::IndexInterior(cell) = cell else {
+                            unreachable!(
+                                "index interior page should only contain index interior cells"
+                            );
+                        };
+                        let payload = self.db.read_full_payload(
+                            cell.payload_size.value(),
+                            cell.payload,
+                            cell.overflow_page,
+                        )?;
+                        let key = parse_text_index_key(payload.as_ref(), index_name)?;
+                        if key.indexed_value == Some(target) {
+                            let val = key
+                                .indexed_value
+                                .map(RecordValue::Text)
+                                .unwrap_or(RecordValue::Null);
+                            visitor(&[val], key.rowid)?;
+                        }
+                        if ChildRange::between(lower_exclusive.as_ref(), key).contains(target) {
+                            pages_to_visit.push(cell.left_child_ptr);
+                        }
+                        lower_exclusive = Some(key.into());
+                    }
 
                     if let Some(right_most_ptr) = btree_page.right_most_ptr
                         && ChildRange::right_of(lower_exclusive.as_ref()).contains(target)
@@ -197,7 +237,7 @@ impl<'a> IndexScanner<'a> {
         Ok(())
     }
 
-    fn visit_prefix_matches<F>(
+    fn visit_prefix_matches_entries<F>(
         &self,
         index_name: &str,
         root_page: u32,
@@ -205,7 +245,7 @@ impl<'a> IndexScanner<'a> {
         visitor: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(u64) -> Result<()>,
+        F: FnMut(&[RecordValue<'_>], u64) -> Result<()>,
     {
         let mut pages_to_visit = vec![root_page];
         let usable_page_size = self.db.usable_page_size();
@@ -226,7 +266,7 @@ impl<'a> IndexScanner<'a> {
                         )?;
                         let key = parse_index_key(payload.as_ref(), index_name)?;
                         if key_matches_prefix(&key, prefix_values) {
-                            visitor(key.rowid)?;
+                            visitor(&key.values, key.rowid)?;
                         }
                     }
                 }
@@ -252,7 +292,7 @@ impl<'a> IndexScanner<'a> {
                         )?;
                         let key = parse_index_key(payload.as_ref(), index_name)?;
                         if key_matches_prefix(&key, prefix_values) {
-                            visitor(key.rowid)?;
+                            visitor(&key.values, key.rowid)?;
                         }
                         pages_to_visit.push(cell.left_child_ptr);
                     }

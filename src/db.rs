@@ -210,12 +210,7 @@ impl SqliteDB {
     pub fn count_rows(&self, table_name: &str) -> Result<usize> {
         let (_, rootpage) = self.resolve_table_root(table_name)?;
         let scanner = TableScanner::new(self);
-        let mut count = 0;
-        scanner.visit_records(table_name, rootpage, |_, _| {
-            count += 1;
-            Ok(())
-        })?;
-        Ok(count)
+        scanner.count_cells(table_name, rootpage)
     }
 
     pub fn select_rows(
@@ -238,16 +233,37 @@ impl SqliteDB {
                     if let Some(index_match) =
                         self.choose_best_index(table_name, conjunction, &resolved_order_by)?
                     {
-                        self.select_rows_via_index_scan(
-                            table_name,
-                            rootpage,
+                        let prefix_values = Self::index_prefix_values(
+                            index_match.entry,
+                            &resolved_predicates,
+                            index_match.prefix_len,
+                        )?;
+                        if Self::index_covers_requested_columns(
+                            index_match.entry,
                             &resolved_columns,
                             &resolved_order_by,
-                            &resolved_predicates,
-                            index_match,
-                            &mut seen_rowids,
-                            &mut rows,
-                        )?;
+                        )? {
+                            self.select_rows_via_covering_index(
+                                table_name,
+                                &resolved_columns,
+                                &resolved_order_by,
+                                index_match,
+                                &prefix_values,
+                                &mut seen_rowids,
+                                &mut rows,
+                            )?;
+                        } else {
+                            self.select_rows_via_index_scan(
+                                table_name,
+                                rootpage,
+                                &resolved_columns,
+                                &resolved_order_by,
+                                &resolved_predicates,
+                                index_match,
+                                &mut seen_rowids,
+                                &mut rows,
+                            )?;
+                        }
                     } else {
                         self.select_rows_via_table_scan(
                             table_name,
@@ -371,6 +387,171 @@ impl SqliteDB {
         )?;
 
         Ok(())
+    }
+
+    fn index_covers_requested_columns(
+        index_entry: &SchemaTableEntry,
+        resolved_columns: &[ResolvedColumn],
+        resolved_order_by: &[ResolvedOrderBy],
+    ) -> Result<bool> {
+        let Some(indexed_columns) = index_entry.indexed_column_names()? else {
+            return Ok(false);
+        };
+        for col in resolved_columns {
+            match col {
+                ResolvedColumn::RowIdAlias => {}
+                ResolvedColumn::RecordColumn { column_name, .. } => {
+                    if !indexed_columns
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(column_name))
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        for order in resolved_order_by {
+            match order.column {
+                ResolvedColumn::RowIdAlias => {}
+                ResolvedColumn::RecordColumn { column_name, .. } => {
+                    if !indexed_columns
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(column_name))
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn select_rows_via_covering_index<'a>(
+        &self,
+        _table_name: &str,
+        resolved_columns: &[ResolvedColumn<'a>],
+        resolved_order_by: &[ResolvedOrderBy<'a>],
+        index_match: IndexMatch<'a>,
+        prefix_values: &[QueryValue],
+        seen_rowids: &mut HashSet<u64>,
+        rows: &mut Vec<MaterializedRow>,
+    ) -> Result<()> {
+        let index_rootpage =
+            index_match
+                .entry
+                .rootpage
+                .ok_or_else(|| SqliteParseError::MissingRootPage {
+                    object_type: "index",
+                    object_name: index_match.entry.name.clone(),
+                })?;
+        let indexed_columns = index_match.entry.indexed_column_names()?.ok_or_else(|| {
+            SqliteParseError::MalformedSchema {
+                object_name: index_match.entry.name.clone(),
+            }
+        })?;
+
+        let index_scanner = IndexScanner::new(self);
+        index_scanner.visit_matching_entries(
+            &index_match.entry.name,
+            index_rootpage,
+            prefix_values,
+            |key_values, rowid| {
+                if !seen_rowids.insert(rowid) {
+                    return Ok(());
+                }
+                let output = resolved_columns
+                    .iter()
+                    .map(|col| {
+                        Self::covering_index_column_output(col, rowid, key_values, indexed_columns)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .join("|");
+                let sort_keys = resolved_order_by
+                    .iter()
+                    .map(|order| {
+                        Self::covering_index_sort_value(
+                            &order.column,
+                            rowid,
+                            key_values,
+                            indexed_columns,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                rows.push(MaterializedRow {
+                    rowid,
+                    output,
+                    sort_keys,
+                });
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    fn covering_index_column_output(
+        column: &ResolvedColumn,
+        rowid: u64,
+        key_values: &[RecordValue],
+        indexed_columns: &[String],
+    ) -> Result<String> {
+        match column {
+            ResolvedColumn::RowIdAlias => Ok(rowid.to_string()),
+            ResolvedColumn::RecordColumn { column_name, .. } => {
+                let idx = indexed_columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(column_name))
+                    .ok_or_else(|| SqliteParseError::ColumnNotFound {
+                        table_name: String::new(),
+                        column_name: column_name.to_string(),
+                    })?;
+                Ok(Self::record_value_to_output_string(
+                    key_values.get(idx).unwrap_or(&RecordValue::Null),
+                ))
+            }
+        }
+    }
+
+    fn covering_index_sort_value(
+        column: &ResolvedColumn,
+        rowid: u64,
+        key_values: &[RecordValue],
+        indexed_columns: &[String],
+    ) -> Result<SortValue> {
+        match column {
+            ResolvedColumn::RowIdAlias => {
+                Ok(SortValue::Integer(i64::try_from(rowid).map_err(|_| {
+                    SqliteParseError::InvalidRootPage(rowid as i64)
+                })?))
+            }
+            ResolvedColumn::RecordColumn { column_name, .. } => {
+                let idx = indexed_columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(column_name))
+                    .ok_or_else(|| SqliteParseError::ColumnNotFound {
+                        table_name: String::new(),
+                        column_name: column_name.to_string(),
+                    })?;
+                Ok(Self::record_value_to_sort_value(
+                    key_values.get(idx).unwrap_or(&RecordValue::Null),
+                ))
+            }
+        }
+    }
+
+    fn record_value_to_output_string(value: &RecordValue) -> String {
+        match value {
+            RecordValue::Null => String::new(),
+            RecordValue::Integer(i) => i.to_string(),
+            RecordValue::Text(s) => s.to_string(),
+        }
+    }
+
+    fn record_value_to_sort_value(value: &RecordValue) -> SortValue {
+        match value {
+            RecordValue::Null => SortValue::Null,
+            RecordValue::Integer(i) => SortValue::Integer(*i),
+            RecordValue::Text(s) => SortValue::Text(s.to_string()),
+        }
     }
 
     fn materialize_row(
@@ -601,6 +782,33 @@ impl SqliteDB {
 
     pub(crate) fn read_btree_page(&self, page_number: u32) -> Result<(Vec<u8>, BTreePage)> {
         read_btree_page_from_path(&self.path, &self.header, page_number)
+    }
+
+    pub(crate) fn count_btree_leaf_cells(
+        &self,
+        root_page: u32,
+        leaf_kind: BTreePageKind,
+        interior_kind: BTreePageKind,
+        mut get_children: impl FnMut(&Self, &BTreePage, &[u8]) -> Result<Vec<u32>>,
+        on_unsupported: impl Fn(u8) -> SqliteParseError,
+    ) -> Result<usize> {
+        let mut pages_to_visit = vec![root_page];
+        let mut count = 0usize;
+        while let Some(page_number) = pages_to_visit.pop() {
+            let (page_bytes, btree_page) = self.read_btree_page(page_number)?;
+            if btree_page.kind == leaf_kind {
+                count += usize::from(btree_page.cell_count);
+            } else if btree_page.kind == interior_kind {
+                pages_to_visit.extend(get_children(self, &btree_page, &page_bytes)?);
+            } else {
+                let pt = page_bytes
+                    .get(btree_page.header_offset)
+                    .copied()
+                    .unwrap_or(0);
+                bail!(on_unsupported(pt));
+            }
+        }
+        Ok(count)
     }
 
     pub(crate) fn usable_page_size(&self) -> usize {
@@ -1372,6 +1580,20 @@ mod tests {
     }
 
     #[test]
+    fn counts_rows_in_companies_table_via_index() {
+        let database = SqliteDB::open(&companies_db_path()).expect("companies db should open");
+
+        let row_count = database
+            .count_rows("companies")
+            .expect("companies row count should parse");
+
+        assert_eq!(
+            row_count, 55_991,
+            "index-only COUNT(*) must match table row count"
+        );
+    }
+
+    #[test]
     fn finds_companies_country_index() {
         let database = SqliteDB::open(&companies_db_path()).expect("companies db should open");
 
@@ -1450,6 +1672,32 @@ mod tests {
                 "5729848|zara mining share company".to_owned(),
                 "6634629|asmara rental".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn selects_country_via_covering_index() {
+        let database = SqliteDB::open(&companies_db_path()).expect("companies db should open");
+
+        let rows = database
+            .select_rows(
+                "companies",
+                &["country".to_owned()],
+                Some(&disjunction(vec![vec![text_term(
+                    "country",
+                    "dominican republic",
+                )]])),
+                &[],
+            )
+            .expect("covering index select should parse");
+
+        assert!(
+            !rows.is_empty(),
+            "should return rows for dominican republic"
+        );
+        assert!(
+            rows.iter().all(|r| r == "dominican republic"),
+            "covering index must return only the indexed column value"
         );
     }
 
