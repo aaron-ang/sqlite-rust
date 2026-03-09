@@ -1,12 +1,17 @@
 use anyhow::Result;
-use clap::Parser;
+use std::ffi::OsString;
 
+use clap::Parser;
 use sqlite_rust::cli::{Cli, DotCommand, UserInput};
-use sqlite_rust::query::SqlStatement;
 use sqlite_rust::db::SqliteDB;
+use sqlite_rust::query::SqlStatement;
+use sqlite_rust::timer::TimingSnapshot;
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let args = normalize_sqlite_args(std::env::args_os());
+    let timer = TimingSnapshot::start()?;
+    let cli = Cli::parse_from(args);
+
     let database = SqliteDB::open(&cli.database_path)?;
 
     match cli.user_input()? {
@@ -35,5 +40,26 @@ fn main() -> Result<()> {
         }
     }
 
+    if cli.shell_config()?.timer_enabled {
+        eprintln!("{}", timer.finish()?.format_sqlite());
+    }
+
     Ok(())
+}
+
+fn normalize_sqlite_args<I, T>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    args.into_iter()
+        .map(Into::into)
+        .map(|arg| {
+            if arg == "-cmd" {
+                OsString::from("--cmd")
+            } else {
+                arg
+            }
+        })
+        .collect()
 }

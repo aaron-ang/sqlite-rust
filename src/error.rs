@@ -36,6 +36,8 @@ pub enum SqliteParseError {
     SqlIncompleteInput,
     #[error("in prepare, unsupported SQL for this stage: {0}")]
     UnsupportedSql(String),
+    #[error("unsupported shell command: {0}")]
+    UnsupportedShellCommand(String),
     #[error("malformed database schema ({object_name})")]
     MalformedSchema { object_name: String },
     #[error("in prepare, no such table: {0}")]
