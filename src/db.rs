@@ -225,6 +225,7 @@ impl SqliteDB {
         let resolved_order_by = Self::resolve_order_by(entry, order_by)?;
         let mut seen_rowids = HashSet::new();
         let mut rows = Vec::new();
+        let mut skip_sort = false;
 
         match where_clause {
             Some(disjunction) => {
@@ -264,6 +265,12 @@ impl SqliteDB {
                                 &mut rows,
                             )?;
                         }
+                        if disjunction.arms.len() == 1
+                            && !resolved_order_by.is_empty()
+                            && index_match.satisfies_order
+                        {
+                            skip_sort = true;
+                        }
                     } else {
                         self.select_rows_via_table_scan(
                             table_name,
@@ -290,7 +297,9 @@ impl SqliteDB {
             }
         }
 
-        Self::sort_rows(&mut rows, &resolved_order_by);
+        if !skip_sort {
+            Self::sort_rows(&mut rows, &resolved_order_by);
+        }
 
         Ok(rows.into_iter().map(|row| row.output).collect())
     }
@@ -1781,6 +1790,32 @@ mod tests {
                 "Fuji".to_owned(),
                 "Golden Delicious".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn orders_companies_by_indexed_country_without_final_sort() {
+        let database = SqliteDB::open(&companies_db_path()).expect("companies db should open");
+
+        let rows = database
+            .select_rows(
+                "companies",
+                &["name".to_owned(), "country".to_owned()],
+                Some(&disjunction(vec![vec![text_term(
+                    "country",
+                    "dominican republic",
+                )]])),
+                &[order_by("country", SortDirection::Asc)],
+            )
+            .expect("indexed and ordered rows should parse");
+
+        assert!(
+            !rows.is_empty(),
+            "should return rows for dominican republic"
+        );
+        assert!(
+            rows.iter().all(|row| row.ends_with("|dominican republic")),
+            "all rows must be for dominican republic"
         );
     }
 

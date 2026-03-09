@@ -34,6 +34,9 @@ SELECT name FROM companies;
 -- Filtered on indexed column (country)
 SELECT name, country FROM companies WHERE country = 'dominican republic';
 
+-- Filtered on indexed column with ORDER BY matching index (exercises skip-sort)
+SELECT name, country FROM companies WHERE country = 'dominican republic' ORDER BY country;
+
 -- Filtered on non-indexed column (industry)
 SELECT name, industry FROM companies WHERE industry = 'computer software';
 
