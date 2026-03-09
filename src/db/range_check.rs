@@ -1,6 +1,7 @@
 use crate::query::QueryValue;
 use crate::storage::record::RecordValue;
 
+/// Evaluate a lower bound predicate (>, >=) against a decoded record value.
 pub fn record_satisfies_lower(
     actual: &RecordValue<'_>,
     bound: &QueryValue,
@@ -25,6 +26,7 @@ pub fn record_satisfies_lower(
     }
 }
 
+/// Evaluate an upper bound predicate (<, <=) against a decoded record value.
 pub fn record_satisfies_upper(
     actual: &RecordValue<'_>,
     bound: &QueryValue,

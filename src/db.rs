@@ -1,13 +1,19 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
-use crate::db_range_helpers::{record_satisfies_lower, record_satisfies_upper};
+mod page_cache;
+mod range_check;
+
+use self::page_cache::PageCache;
+use self::range_check::{record_satisfies_lower, record_satisfies_upper};
 use crate::error::SqliteParseError;
 use crate::query::{
     Conjunction, Disjunction, OrderByTerm, QueryValue, SortDirection, WhereOperator,
@@ -197,6 +203,7 @@ pub struct SqliteDB {
     path: PathBuf,
     header: DatabaseHeader,
     schema_table: SchemaTable,
+    page_cache: RefCell<PageCache>,
 }
 
 impl SqliteDB {
@@ -210,11 +217,13 @@ impl SqliteDB {
 
         let header = DatabaseHeader::parse(&header_bytes)?;
         let schema_table = load_schema_table(path, &header)?;
+        let page_cache = PageCache::new(header.page_size, 1024);
 
         Ok(Self {
             path: path.to_path_buf(),
             header,
             schema_table,
+            page_cache: RefCell::new(page_cache),
         })
     }
 
@@ -230,7 +239,7 @@ impl SqliteDB {
     }
 
     pub fn read_page(&self, page_number: u32) -> Result<Vec<u8>> {
-        read_page_from_path(&self.path, self.header.page_size, page_number)
+        Ok(self.read_page_cached(page_number)?.as_ref().to_vec())
     }
 
     pub fn count_rows(&self, table_name: &str) -> Result<usize> {
@@ -271,7 +280,6 @@ impl SqliteDB {
                             &resolved_order_by,
                         )? {
                             self.select_rows_via_covering_index(
-                                table_name,
                                 &resolved_columns,
                                 &resolved_order_by,
                                 &index_match,
@@ -474,7 +482,6 @@ impl SqliteDB {
 
     fn select_rows_via_covering_index<'a>(
         &self,
-        _table_name: &str,
         resolved_columns: &[ResolvedColumn<'a>],
         resolved_order_by: &[ResolvedOrderBy<'a>],
         index_match: &IndexMatch<'_, '_>,
@@ -937,7 +944,14 @@ impl SqliteDB {
     }
 
     pub(crate) fn read_btree_page(&self, page_number: u32) -> Result<(Vec<u8>, BTreePage)> {
-        read_btree_page_from_path(&self.path, &self.header, page_number)
+        let page = self.read_page_cached(page_number)?;
+        let header_offset = if page_number == 1 {
+            SQLITE_HEADER_LEN
+        } else {
+            0
+        };
+        let btree_page = BTreePage::parse(&page, header_offset)?;
+        Ok((page.as_ref().to_vec(), btree_page))
     }
 
     pub(crate) fn count_btree_leaf_cells(
@@ -971,19 +985,55 @@ impl SqliteDB {
         self.header.usable_page_size()
     }
 
+    fn read_page_cached(&self, page_number: u32) -> Result<Arc<[u8]>> {
+        let page_size = self.header.page_size;
+        let path = self.path.clone();
+        let mut cache = self.page_cache.borrow_mut();
+        cache.get_or_load(page_number, |page_no| {
+            read_page_from_path(&path, page_size, page_no)
+        })
+    }
+
     pub(crate) fn read_full_payload<'a>(
         &self,
         payload_size: u64,
         local_payload: &'a [u8],
         overflow_page: Option<u32>,
     ) -> Result<Cow<'a, [u8]>> {
-        read_full_payload_from_path(
-            &self.path,
-            &self.header,
-            payload_size,
-            local_payload,
-            overflow_page,
-        )
+        let payload_size = usize::try_from(payload_size)
+            .map_err(|_| SqliteParseError::InvalidPayloadSize(payload_size))?;
+        if overflow_page.is_none() || payload_size <= local_payload.len() {
+            return Ok(Cow::Borrowed(local_payload));
+        }
+
+        let mut full_payload = Vec::with_capacity(payload_size);
+        full_payload.extend_from_slice(local_payload);
+
+        let mut next_page = overflow_page;
+        let overflow_chunk_size = self.header.usable_page_size() - size_of::<u32>();
+
+        while full_payload.len() < payload_size {
+            let page_number = next_page.ok_or(SqliteParseError::TruncatedOverflowChain)?;
+            let page = self.read_page_cached(page_number)?;
+
+            let (next, _chunk) = page
+                .split_first_chunk::<4>()
+                .ok_or(SqliteParseError::TruncatedOverflowChain)?;
+            next_page = match u32::from_be_bytes(*next) {
+                0 => None,
+                page_number => Some(page_number),
+            };
+
+            let remaining = payload_size - full_payload.len();
+            let chunk_len = remaining.min(overflow_chunk_size);
+            let chunk_end = size_of::<u32>() + chunk_len;
+            full_payload.extend_from_slice(
+                page.get(size_of::<u32>()..chunk_end)
+                    .ok_or(SqliteParseError::TruncatedOverflowChain)?,
+            );
+        }
+
+        Ok(Cow::Owned(full_payload))
     }
 
     fn resolve_table_root(&self, table_name: &str) -> Result<(&SchemaTableEntry, u32)> {
@@ -1044,7 +1094,13 @@ fn load_schema_table(path: &Path, header: &DatabaseHeader) -> Result<SchemaTable
     let mut entries = Vec::new();
 
     while let Some(page_number) = pages_to_visit.pop() {
-        let (page_bytes, btree_page) = read_btree_page_from_path(path, header, page_number)?;
+        let page_bytes = read_page_from_path(path, header.page_size, page_number)?;
+        let header_offset = if page_number == 1 {
+            SQLITE_HEADER_LEN
+        } else {
+            0
+        };
+        let btree_page = BTreePage::parse(&page_bytes, header_offset)?;
 
         match btree_page.kind {
             BTreePageKind::TableLeaf => {
@@ -1115,21 +1171,6 @@ fn read_page_from_path(path: &Path, page_size: u32, page_number: u32) -> Result<
         .with_context(|| format!("failed to read page {page_number}"))?;
 
     Ok(page)
-}
-
-fn read_btree_page_from_path(
-    path: &Path,
-    header: &DatabaseHeader,
-    page_number: u32,
-) -> Result<(Vec<u8>, BTreePage)> {
-    let page = read_page_from_path(path, header.page_size, page_number)?;
-    let header_offset = if page_number == 1 {
-        SQLITE_HEADER_LEN
-    } else {
-        0
-    };
-    let btree_page = BTreePage::parse(&page, header_offset)?;
-    Ok((page, btree_page))
 }
 
 fn read_full_payload_from_path<'a>(
