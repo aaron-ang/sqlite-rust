@@ -4,16 +4,17 @@ use anyhow::{Result, bail};
 
 use crate::db::SqliteDB;
 use crate::error::SqliteParseError;
-use crate::page::{BTreeCell, BTreePageKind};
-use crate::record::Record;
+use crate::query::QueryValue;
+use super::page::{BTreeCell, BTreePageKind};
+use super::record::{Record, RecordValue};
 
 #[derive(Clone, Copy, Debug)]
-struct IndexKey<'a> {
+struct TextIndexKey<'a> {
     indexed_value: Option<&'a str>,
     rowid: u64,
 }
 
-impl<'a> IndexKey<'a> {
+impl<'a> TextIndexKey<'a> {
     fn cmp_upper_probe(&self, target: &str) -> Ordering {
         match self.indexed_value {
             Some(value) => value.cmp(target),
@@ -24,12 +25,12 @@ impl<'a> IndexKey<'a> {
 }
 
 #[derive(Debug)]
-struct PersistedIndexKey {
+struct PersistedTextIndexKey {
     indexed_value: Option<String>,
     rowid: u64,
 }
 
-impl PersistedIndexKey {
+impl PersistedTextIndexKey {
     fn cmp_lower_probe(&self, target: &str) -> Ordering {
         match self.indexed_value.as_deref() {
             Some(value) => value.cmp(target),
@@ -39,9 +40,9 @@ impl PersistedIndexKey {
     }
 }
 
-impl<'a> From<IndexKey<'a>> for PersistedIndexKey {
-    fn from(key: IndexKey<'a>) -> Self {
-        PersistedIndexKey {
+impl<'a> From<TextIndexKey<'a>> for PersistedTextIndexKey {
+    fn from(key: TextIndexKey<'a>) -> Self {
+        Self {
             indexed_value: key.indexed_value.map(str::to_owned),
             rowid: key.rowid,
         }
@@ -50,14 +51,14 @@ impl<'a> From<IndexKey<'a>> for PersistedIndexKey {
 
 #[derive(Debug)]
 struct ChildRange<'a, 'b> {
-    lower_exclusive: Option<&'a PersistedIndexKey>,
-    upper_exclusive: Option<IndexKey<'b>>,
+    lower_exclusive: Option<&'a PersistedTextIndexKey>,
+    upper_exclusive: Option<TextIndexKey<'b>>,
 }
 
 impl<'a, 'b> ChildRange<'a, 'b> {
     fn between(
-        lower_exclusive: Option<&'a PersistedIndexKey>,
-        upper_exclusive: IndexKey<'b>,
+        lower_exclusive: Option<&'a PersistedTextIndexKey>,
+        upper_exclusive: TextIndexKey<'b>,
     ) -> Self {
         Self {
             lower_exclusive,
@@ -65,7 +66,7 @@ impl<'a, 'b> ChildRange<'a, 'b> {
         }
     }
 
-    fn right_of(lower_exclusive: Option<&'a PersistedIndexKey>) -> Self {
+    fn right_of(lower_exclusive: Option<&'a PersistedTextIndexKey>) -> Self {
         Self {
             lower_exclusive,
             upper_exclusive: None,
@@ -83,6 +84,12 @@ impl<'a, 'b> ChildRange<'a, 'b> {
     }
 }
 
+#[derive(Debug)]
+struct ParsedIndexKey<'a> {
+    values: Vec<RecordValue<'a>>,
+    rowid: u64,
+}
+
 pub struct IndexScanner<'a> {
     db: &'a SqliteDB,
 }
@@ -96,8 +103,24 @@ impl<'a> IndexScanner<'a> {
         &self,
         index_name: &str,
         root_page: u32,
-        target: &str,
+        prefix_values: &[QueryValue],
         mut visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64) -> Result<()>,
+    {
+        if let [QueryValue::Text(target)] = prefix_values {
+            return self.visit_text_matches(index_name, root_page, target, &mut visitor);
+        }
+        self.visit_prefix_matches(index_name, root_page, prefix_values, &mut visitor)
+    }
+
+    fn visit_text_matches<F>(
+        &self,
+        index_name: &str,
+        root_page: u32,
+        target: &str,
+        visitor: &mut F,
     ) -> Result<()>
     where
         F: FnMut(u64) -> Result<()>,
@@ -124,7 +147,7 @@ impl<'a> IndexScanner<'a> {
                                 cell.payload,
                                 cell.overflow_page,
                             )?;
-                            let key = parse_index_key(payload.as_ref(), index_name)?;
+                            let key = parse_text_index_key(payload.as_ref(), index_name)?;
                             if key.indexed_value == Some(target) {
                                 visitor(key.rowid)?;
                             }
@@ -132,7 +155,7 @@ impl<'a> IndexScanner<'a> {
                         })?;
                 }
                 BTreePageKind::IndexInterior => {
-                    let mut lower_exclusive: Option<PersistedIndexKey> = None;
+                    let mut lower_exclusive: Option<PersistedTextIndexKey> = None;
 
                     btree_page
                         .cells(&page_bytes, usable_page_size)?
@@ -148,7 +171,7 @@ impl<'a> IndexScanner<'a> {
                                 cell.payload,
                                 cell.overflow_page,
                             )?;
-                            let key = parse_index_key(payload.as_ref(), index_name)?;
+                            let key = parse_text_index_key(payload.as_ref(), index_name)?;
                             if key.indexed_value == Some(target) {
                                 visitor(key.rowid)?;
                             }
@@ -166,15 +189,76 @@ impl<'a> IndexScanner<'a> {
                     }
                 }
                 _ => {
-                    let page_type = page_bytes
-                        .get(btree_page.header_offset)
-                        .copied()
-                        .unwrap_or_default();
-                    bail!(SqliteParseError::UnsupportedRootPageType {
-                        object_type: "index",
-                        object_name: index_name.to_owned(),
-                        page_type,
-                    });
+                    bail_unsupported_index_page(index_name, &page_bytes, btree_page.header_offset)?
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn visit_prefix_matches<F>(
+        &self,
+        index_name: &str,
+        root_page: u32,
+        prefix_values: &[QueryValue],
+        visitor: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64) -> Result<()>,
+    {
+        let mut pages_to_visit = vec![root_page];
+        let usable_page_size = self.db.usable_page_size();
+
+        while let Some(page_number) = pages_to_visit.pop() {
+            let (page_bytes, btree_page) = self.db.read_btree_page(page_number)?;
+
+            match btree_page.kind {
+                BTreePageKind::IndexLeaf => {
+                    for cell in btree_page.cells(&page_bytes, usable_page_size)? {
+                        let BTreeCell::IndexLeaf(cell) = cell else {
+                            unreachable!("index leaf page should only contain index leaf cells");
+                        };
+                        let payload = self.db.read_full_payload(
+                            cell.payload_size.value(),
+                            cell.payload,
+                            cell.overflow_page,
+                        )?;
+                        let key = parse_index_key(payload.as_ref(), index_name)?;
+                        if key_matches_prefix(&key, prefix_values) {
+                            visitor(key.rowid)?;
+                        }
+                    }
+                }
+                BTreePageKind::IndexInterior => {
+                    if let Some(right_most_ptr) = btree_page.right_most_ptr {
+                        pages_to_visit.push(right_most_ptr);
+                    }
+
+                    for cell in btree_page
+                        .cells(&page_bytes, usable_page_size)?
+                        .into_iter()
+                        .rev()
+                    {
+                        let BTreeCell::IndexInterior(cell) = cell else {
+                            unreachable!(
+                                "index interior page should only contain index interior cells"
+                            );
+                        };
+                        let payload = self.db.read_full_payload(
+                            cell.payload_size.value(),
+                            cell.payload,
+                            cell.overflow_page,
+                        )?;
+                        let key = parse_index_key(payload.as_ref(), index_name)?;
+                        if key_matches_prefix(&key, prefix_values) {
+                            visitor(key.rowid)?;
+                        }
+                        pages_to_visit.push(cell.left_child_ptr);
+                    }
+                }
+                _ => {
+                    bail_unsupported_index_page(index_name, &page_bytes, btree_page.header_offset)?
                 }
             }
         }
@@ -183,7 +267,7 @@ impl<'a> IndexScanner<'a> {
     }
 }
 
-fn parse_index_key<'a>(payload: &'a [u8], index_name: &str) -> Result<IndexKey<'a>> {
+fn parse_text_index_key<'a>(payload: &'a [u8], index_name: &str) -> Result<TextIndexKey<'a>> {
     let record = Record::parse(payload)?;
     let columns = record.columns();
     if columns.len() < 2 {
@@ -201,12 +285,70 @@ fn parse_index_key<'a>(payload: &'a [u8], index_name: &str) -> Result<IndexKey<'
             index_name: index_name.to_owned(),
         })?;
 
-    Ok(IndexKey {
+    Ok(TextIndexKey {
         indexed_value,
         rowid: u64::try_from(rowid).map_err(|_| SqliteParseError::MalformedIndexEntry {
             index_name: index_name.to_owned(),
         })?,
     })
+}
+
+fn parse_index_key<'a>(payload: &'a [u8], index_name: &str) -> Result<ParsedIndexKey<'a>> {
+    let record = Record::parse(payload)?;
+    let columns = record.columns();
+    if columns.len() < 2 {
+        bail!(SqliteParseError::MalformedIndexEntry {
+            index_name: index_name.to_owned(),
+        });
+    }
+
+    let mut values = Vec::with_capacity(columns.len() - 1);
+    for (index, column) in columns[..columns.len() - 1].iter().enumerate() {
+        values.push(column.decode_value(format!("{index_name}.key{index}"))?);
+    }
+
+    let rowid = columns
+        .last()
+        .expect("index record must have at least 2 columns")
+        .decode_optional_integer(format!("{index_name}.rowid"))?
+        .ok_or_else(|| SqliteParseError::MalformedIndexEntry {
+            index_name: index_name.to_owned(),
+        })?;
+
+    Ok(ParsedIndexKey {
+        values,
+        rowid: u64::try_from(rowid).map_err(|_| SqliteParseError::MalformedIndexEntry {
+            index_name: index_name.to_owned(),
+        })?,
+    })
+}
+
+fn key_matches_prefix(key: &ParsedIndexKey<'_>, prefix_values: &[QueryValue]) -> bool {
+    if key.values.len() < prefix_values.len() {
+        return false;
+    }
+
+    prefix_values
+        .iter()
+        .zip(key.values.iter())
+        .all(|(expected, actual)| match (expected, actual) {
+            (QueryValue::Text(expected), RecordValue::Text(actual)) => expected == actual,
+            (QueryValue::Integer(expected), RecordValue::Integer(actual)) => expected == actual,
+            _ => false,
+        })
+}
+
+fn bail_unsupported_index_page(
+    index_name: &str,
+    page_bytes: &[u8],
+    header_offset: usize,
+) -> Result<()> {
+    let page_type = page_bytes.get(header_offset).copied().unwrap_or_default();
+    bail!(SqliteParseError::UnsupportedRootPageType {
+        object_type: "index",
+        object_name: index_name.to_owned(),
+        page_type,
+    });
 }
 
 #[cfg(test)]
@@ -215,13 +357,13 @@ mod tests {
 
     #[test]
     fn child_range_contains_target_inside_bounds() {
-        let lower = PersistedIndexKey {
+        let lower = PersistedTextIndexKey {
             indexed_value: Some("alpha".to_owned()),
             rowid: 10,
         };
         let range = ChildRange::between(
             Some(&lower),
-            IndexKey {
+            TextIndexKey {
                 indexed_value: Some("gamma"),
                 rowid: 5,
             },
@@ -232,7 +374,7 @@ mod tests {
 
     #[test]
     fn child_range_includes_exact_lower_value_for_equal_probe() {
-        let lower = PersistedIndexKey {
+        let lower = PersistedTextIndexKey {
             indexed_value: Some("eritrea".to_owned()),
             rowid: 17,
         };
@@ -245,7 +387,7 @@ mod tests {
     fn child_range_includes_exact_upper_value_for_equal_probe() {
         let range = ChildRange::between(
             None,
-            IndexKey {
+            TextIndexKey {
                 indexed_value: Some("eritrea"),
                 rowid: 17,
             },
@@ -263,7 +405,7 @@ mod tests {
 
     #[test]
     fn null_indexed_values_sort_before_text() {
-        let key = IndexKey {
+        let key = TextIndexKey {
             indexed_value: None,
             rowid: 1,
         };
@@ -273,18 +415,41 @@ mod tests {
 
     #[test]
     fn eritrea_boundary_child_range_still_contains_target() {
-        let lower = PersistedIndexKey {
+        let lower = PersistedTextIndexKey {
             indexed_value: Some("egypt".to_owned()),
             rowid: 99,
         };
         let range = ChildRange::between(
             Some(&lower),
-            IndexKey {
+            TextIndexKey {
                 indexed_value: Some("ethiopia"),
                 rowid: 1,
             },
         );
 
         assert!(range.contains("eritrea"));
+    }
+
+    #[test]
+    fn matches_text_and_integer_prefix_values() {
+        let key = ParsedIndexKey {
+            values: vec![RecordValue::Text("Yellow"), RecordValue::Integer(4)],
+            rowid: 4,
+        };
+
+        assert!(key_matches_prefix(
+            &key,
+            &[
+                QueryValue::Text("Yellow".to_owned()),
+                QueryValue::Integer(4)
+            ]
+        ));
+        assert!(!key_matches_prefix(
+            &key,
+            &[
+                QueryValue::Text("Yellow".to_owned()),
+                QueryValue::Integer(5)
+            ]
+        ));
     }
 }

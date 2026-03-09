@@ -10,7 +10,7 @@ use sqlparser::{
 use strum::EnumString;
 
 use crate::error::SqliteParseError;
-use crate::record::Record;
+use super::record::Record;
 
 const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
@@ -51,19 +51,31 @@ impl SchemaTable {
         })
     }
 
+    pub fn indexes_for_table(&self, table_name: &str) -> impl Iterator<Item = &SchemaTableEntry> {
+        self.entries.iter().filter(|entry| {
+            entry.object_type == SchemaObjectType::Index
+                && entry.table_name.eq_ignore_ascii_case(table_name)
+                && entry.indexed_column_names().ok().flatten().is_some()
+        })
+    }
+
     pub fn find_index_for_column(
         &self,
         table_name: &str,
         column_name: &str,
     ) -> Option<&SchemaTableEntry> {
         self.entries.iter().find(|entry| {
-            entry.object_type == SchemaObjectType::Index
-                && entry.table_name.eq_ignore_ascii_case(table_name)
-                && entry
-                    .indexed_column_name()
-                    .ok()
-                    .flatten()
-                    .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column_name))
+            if entry.object_type != SchemaObjectType::Index
+                || !entry.table_name.eq_ignore_ascii_case(table_name)
+            {
+                return false;
+            }
+            entry
+                .indexed_column_names()
+                .ok()
+                .flatten()
+                .and_then(|columns| columns.first())
+                .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column_name))
         })
     }
 }
@@ -104,13 +116,13 @@ impl SchemaTableEntry {
         }
     }
 
-    pub fn indexed_column_name(&self) -> Result<Option<&str>> {
+    pub fn indexed_column_names(&self) -> Result<Option<&[String]>> {
         if self.object_type != SchemaObjectType::Index {
             return Ok(None);
         }
 
         match self.metadata()? {
-            SchemaMetadata::Index(index) => Ok(index.indexed_column_name.as_deref()),
+            SchemaMetadata::Index(index) => Ok(index.indexed_column_names.as_deref()),
             _ => bail!(SqliteParseError::MalformedSchema {
                 object_name: self.name.clone(),
             }),
@@ -281,14 +293,12 @@ impl TableMetadata {
 
 #[derive(Debug)]
 struct IndexMetadata {
-    indexed_column_name: Option<String>,
+    indexed_column_names: Option<Vec<String>>,
 }
 
 impl IndexMetadata {
     fn from_create_index(create_index: sqlparser::ast::CreateIndex) -> Self {
-        let indexed_column_name = if create_index.unique
-            || create_index.concurrently
-            || create_index.if_not_exists
+        let indexed_column_names = if create_index.concurrently
             || !create_index.include.is_empty()
             || create_index.nulls_distinct.is_some()
             || !create_index.with.is_empty()
@@ -296,27 +306,31 @@ impl IndexMetadata {
             || !create_index.index_options.is_empty()
             || !create_index.alter_options.is_empty()
             || create_index.using.is_some()
-            || create_index.columns.len() != 1
+            || create_index.columns.is_empty()
         {
             None
         } else {
-            let index_column = &create_index.columns[0];
-            if index_column.operator_class.is_some()
-                || index_column.column.options.asc.is_some()
-                || index_column.column.options.nulls_first.is_some()
-                || index_column.column.with_fill.is_some()
-            {
-                None
-            } else {
-                match &index_column.column.expr {
-                    Expr::Identifier(identifier) => Some(identifier.value.clone()),
-                    _ => None,
-                }
-            }
+            create_index
+                .columns
+                .iter()
+                .map(|index_column| {
+                    if index_column.operator_class.is_some()
+                        || index_column.column.options.asc.is_some()
+                        || index_column.column.options.nulls_first.is_some()
+                        || index_column.column.with_fill.is_some()
+                    {
+                        return None;
+                    }
+                    match &index_column.column.expr {
+                        Expr::Identifier(identifier) => Some(identifier.value.clone()),
+                        _ => None,
+                    }
+                })
+                .collect()
         };
 
         Self {
-            indexed_column_name,
+            indexed_column_names,
         }
     }
 }
@@ -367,7 +381,27 @@ mod tests {
             metadata: OnceLock::new(),
         };
 
-        assert_eq!(entry.indexed_column_name().unwrap(), Some("country"));
+        assert_eq!(
+            entry.indexed_column_names().unwrap(),
+            Some(&["country".to_owned()][..])
+        );
+    }
+
+    #[test]
+    fn parses_multi_column_index_metadata() {
+        let entry = SchemaTableEntry {
+            object_type: SchemaObjectType::Index,
+            name: "idx_apples_color_name".to_owned(),
+            table_name: "apples".to_owned(),
+            rootpage: Some(4),
+            sql: Some("CREATE INDEX idx_apples_color_name ON apples (color, name)".to_owned()),
+            metadata: OnceLock::new(),
+        };
+
+        assert_eq!(
+            entry.indexed_column_names().unwrap(),
+            Some(&["color".to_owned(), "name".to_owned()][..])
+        );
     }
 
     #[test]

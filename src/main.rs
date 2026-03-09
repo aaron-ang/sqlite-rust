@@ -2,10 +2,12 @@ use anyhow::Result;
 use std::ffi::OsString;
 
 use clap::Parser;
-use sqlite_rust::cli::{Cli, DotCommand, UserInput};
-use sqlite_rust::db::SqliteDB;
-use sqlite_rust::query::SqlStatement;
-use sqlite_rust::timer::TimingSnapshot;
+use sqlite_rust::{
+    cli::{Cli, DotCommand, UserInput},
+    db::SqliteDB,
+    query::SqlStatement,
+    timer::TimingSnapshot,
+};
 
 fn main() -> Result<()> {
     let args = normalize_sqlite_args(std::env::args_os());
@@ -30,11 +32,12 @@ fn main() -> Result<()> {
             table_name,
             column_names,
             where_clause,
+            order_by,
         }) => {
             println!(
                 "{}",
                 database
-                    .select_rows(&table_name, &column_names, where_clause.as_ref())?
+                    .select_rows(&table_name, &column_names, where_clause.as_ref(), &order_by)?
                     .join("\n")
             );
         }

@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 use crate::error::SqliteParseError;
-use crate::varint::SqliteVarint;
+use super::varint::SqliteVarint;
 
 #[derive(Debug, PartialEq)]
 pub struct Record<'a> {
@@ -68,6 +68,13 @@ pub struct RecordColumn<'a> {
     value: &'a [u8],
 }
 
+#[derive(Debug)]
+pub enum RecordValue<'a> {
+    Null,
+    Integer(i64),
+    Text(&'a str),
+}
+
 impl<'a> RecordColumn<'a> {
     pub fn value(self) -> &'a [u8] {
         self.value
@@ -95,8 +102,6 @@ impl<'a> RecordColumn<'a> {
     }
 
     pub fn decode_output_value(self, column: impl Into<String>) -> Result<String> {
-        let column = column.into();
-
         if self.serial_type.is_null() {
             return Ok(String::new());
         }
@@ -113,14 +118,36 @@ impl<'a> RecordColumn<'a> {
         }
 
         bail!(SqliteParseError::UnexpectedSerialType {
-            column,
+            column: column.into(),
+            expected: "text, integer, or null",
+            serial_type: self.serial_type.code(),
+        })
+    }
+
+    pub fn decode_value(self, column: impl Into<String>) -> Result<RecordValue<'a>> {
+        if self.serial_type.is_null() {
+            return Ok(RecordValue::Null);
+        }
+
+        if self.serial_type.is_text() {
+            return Ok(RecordValue::Text(self.decode_text(column)?));
+        }
+
+        if self.serial_type.is_integer() {
+            return Ok(RecordValue::Integer(
+                self.decode_optional_integer(column)?
+                    .expect("non-null integer serial type should decode to a value"),
+            ));
+        }
+
+        bail!(SqliteParseError::UnexpectedSerialType {
+            column: column.into(),
             expected: "text, integer, or null",
             serial_type: self.serial_type.code(),
         })
     }
 
     pub fn decode_optional_integer(self, column: impl Into<String>) -> Result<Option<i64>> {
-        let column = column.into();
         match self.serial_type {
             SerialType::Fixed(FixedSerialType::Null) => Ok(None),
             serial_type if serial_type.is_integer() => Ok(Some(match serial_type {
@@ -129,7 +156,7 @@ impl<'a> RecordColumn<'a> {
                 _ => decode_signed_integer(self.value),
             })),
             _ => bail!(SqliteParseError::UnexpectedSerialType {
-                column,
+                column: column.into(),
                 expected: "integer",
                 serial_type: self.serial_type.code(),
             }),

@@ -3,7 +3,7 @@ use bytes::Buf;
 use num_enum::TryFromPrimitive;
 
 use crate::error::SqliteParseError;
-use crate::varint::SqliteVarint;
+use super::varint::SqliteVarint;
 
 const PAGE_ONE_HEADER_OFFSET: usize = 100;
 const LEAF_BTREE_HEADER_SIZE: usize = 8;
