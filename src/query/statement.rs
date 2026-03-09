@@ -24,7 +24,19 @@ pub struct Conjunction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhereTerm {
     pub column_name: String,
+    pub op: WhereOperator,
     pub value: QueryValue,
+    pub second_value: Option<QueryValue>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhereOperator {
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Between,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

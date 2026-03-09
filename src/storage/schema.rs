@@ -232,7 +232,7 @@ impl SchemaTableEntry {
         }
 
         let type_str = columns[0].decode_text(format!("{SCHEMA_TABLE_NAME}.type"))?;
-        let object_type = SchemaObjectType::from_str(&type_str)
+        let object_type = SchemaObjectType::from_str(type_str)
             .map_err(|_| SqliteParseError::InvalidSchemaObjectType(type_str.to_owned()))?;
         let name = columns[1].decode_text(format!("{SCHEMA_TABLE_NAME}.name"))?;
         let table_name = columns[2].decode_text(format!("{SCHEMA_TABLE_NAME}.tbl_name"))?;

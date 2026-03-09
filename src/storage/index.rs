@@ -149,12 +149,98 @@ impl<'a> IndexScanner<'a> {
         mut visitor: F,
     ) -> Result<()>
     where
-        F: FnMut(&[RecordValue<'_>], u64) -> Result<()>,
+        F: FnMut(&[RecordValue], u64) -> Result<()>,
     {
         if let [QueryValue::Text(target)] = prefix_values {
             return self.visit_text_matches_entries(index_name, root_page, target, &mut visitor);
         }
         self.visit_prefix_matches_entries(index_name, root_page, prefix_values, &mut visitor)
+    }
+
+    pub fn visit_range_rowids<F>(
+        &self,
+        index_name: &str,
+        root_page: u32,
+        lower: Option<(&QueryValue, bool)>,
+        upper: Option<(&QueryValue, bool)>,
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64) -> Result<()>,
+    {
+        self.visit_range_entries(index_name, root_page, lower, upper, |_, rowid| {
+            visitor(rowid)
+        })
+    }
+
+    pub fn visit_range_entries<F>(
+        &self,
+        index_name: &str,
+        root_page: u32,
+        lower: Option<(&QueryValue, bool)>,
+        upper: Option<(&QueryValue, bool)>,
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[RecordValue], u64) -> Result<()>,
+    {
+        let mut pages_to_visit = vec![root_page];
+        let usable_page_size = self.db.usable_page_size();
+
+        while let Some(page_number) = pages_to_visit.pop() {
+            let (page_bytes, btree_page) = self.db.read_btree_page(page_number)?;
+
+            match btree_page.kind {
+                BTreePageKind::IndexLeaf => {
+                    for cell in btree_page.cells(&page_bytes, usable_page_size)? {
+                        let BTreeCell::IndexLeaf(cell) = cell else {
+                            unreachable!("index leaf page should only contain index leaf cells");
+                        };
+                        let payload = self.db.read_full_payload(
+                            cell.payload_size.value(),
+                            cell.payload,
+                            cell.overflow_page,
+                        )?;
+                        let key = parse_index_key(payload.as_ref(), index_name)?;
+                        if key_in_range(&key, lower, upper) {
+                            visitor(&key.values, key.rowid)?;
+                        }
+                    }
+                }
+                BTreePageKind::IndexInterior => {
+                    if let Some(right_most_ptr) = btree_page.right_most_ptr {
+                        pages_to_visit.push(right_most_ptr);
+                    }
+
+                    for cell in btree_page
+                        .cells(&page_bytes, usable_page_size)?
+                        .into_iter()
+                        .rev()
+                    {
+                        let BTreeCell::IndexInterior(cell) = cell else {
+                            unreachable!(
+                                "index interior page should only contain index interior cells"
+                            );
+                        };
+                        let payload = self.db.read_full_payload(
+                            cell.payload_size.value(),
+                            cell.payload,
+                            cell.overflow_page,
+                        )?;
+                        let key = parse_index_key(payload.as_ref(), index_name)?;
+                        if key_in_range(&key, lower, upper) {
+                            visitor(&key.values, key.rowid)?;
+                        }
+                        pages_to_visit.push(cell.left_child_ptr);
+                    }
+                }
+                _ => {
+                    bail_unsupported_index_page(index_name, &page_bytes, btree_page.header_offset)?
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn visit_text_matches_entries<F>(
@@ -165,7 +251,7 @@ impl<'a> IndexScanner<'a> {
         visitor: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&[RecordValue<'_>], u64) -> Result<()>,
+        F: FnMut(&[RecordValue], u64) -> Result<()>,
     {
         let mut pages_to_visit = vec![root_page];
         let usable_page_size = self.db.usable_page_size();
@@ -245,7 +331,7 @@ impl<'a> IndexScanner<'a> {
         visitor: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&[RecordValue<'_>], u64) -> Result<()>,
+        F: FnMut(&[RecordValue], u64) -> Result<()>,
     {
         let mut pages_to_visit = vec![root_page];
         let usable_page_size = self.db.usable_page_size();
@@ -363,7 +449,7 @@ fn parse_index_key<'a>(payload: &'a [u8], index_name: &str) -> Result<ParsedInde
     })
 }
 
-fn key_matches_prefix(key: &ParsedIndexKey<'_>, prefix_values: &[QueryValue]) -> bool {
+fn key_matches_prefix(key: &ParsedIndexKey, prefix_values: &[QueryValue]) -> bool {
     if key.values.len() < prefix_values.len() {
         return false;
     }
@@ -376,6 +462,67 @@ fn key_matches_prefix(key: &ParsedIndexKey<'_>, prefix_values: &[QueryValue]) ->
             (QueryValue::Integer(expected), RecordValue::Integer(actual)) => expected == actual,
             _ => false,
         })
+}
+
+fn key_in_range(
+    key: &ParsedIndexKey,
+    lower: Option<(&QueryValue, bool)>,
+    upper: Option<(&QueryValue, bool)>,
+) -> bool {
+    let Some(first) = key.values.first() else {
+        return false;
+    };
+    if let Some((bound, inclusive)) = lower
+        && !value_satisfies_lower(first, bound, inclusive)
+    {
+        return false;
+    }
+    if let Some((bound, inclusive)) = upper
+        && !value_satisfies_upper(first, bound, inclusive)
+    {
+        return false;
+    }
+    true
+}
+
+fn value_satisfies_lower(value: &RecordValue, bound: &QueryValue, inclusive: bool) -> bool {
+    match (value, bound) {
+        (RecordValue::Text(actual), QueryValue::Text(min)) => {
+            if inclusive {
+                *actual >= min.as_str()
+            } else {
+                *actual > min.as_str()
+            }
+        }
+        (RecordValue::Integer(actual), QueryValue::Integer(min)) => {
+            if inclusive {
+                *actual >= *min
+            } else {
+                *actual > *min
+            }
+        }
+        _ => false,
+    }
+}
+
+fn value_satisfies_upper(value: &RecordValue, bound: &QueryValue, inclusive: bool) -> bool {
+    match (value, bound) {
+        (RecordValue::Text(actual), QueryValue::Text(max)) => {
+            if inclusive {
+                *actual <= max.as_str()
+            } else {
+                *actual < max.as_str()
+            }
+        }
+        (RecordValue::Integer(actual), QueryValue::Integer(max)) => {
+            if inclusive {
+                *actual <= *max
+            } else {
+                *actual < *max
+            }
+        }
+        _ => false,
+    }
 }
 
 fn bail_unsupported_index_page(

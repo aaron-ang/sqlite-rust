@@ -7,8 +7,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::db_range_helpers::{record_satisfies_lower, record_satisfies_upper};
 use crate::error::SqliteParseError;
-use crate::query::{Conjunction, Disjunction, OrderByTerm, QueryValue, SortDirection};
+use crate::query::{
+    Conjunction, Disjunction, OrderByTerm, QueryValue, SortDirection, WhereOperator,
+};
 use crate::storage::{
     index::IndexScanner,
     page::{BTreeCell, BTreePage, BTreePageKind},
@@ -31,7 +34,9 @@ enum ResolvedColumn<'a> {
 #[derive(Clone, Copy, Debug)]
 struct ResolvedPredicate<'a> {
     column: ResolvedColumn<'a>,
+    op: WhereOperator,
     value: &'a QueryValue,
+    second_value: Option<&'a QueryValue>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -55,19 +60,29 @@ struct MaterializedRow {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct IndexMatch<'a> {
-    entry: &'a SchemaTableEntry,
+struct IndexMatch<'schema, 'q> {
+    entry: &'schema SchemaTableEntry,
     prefix_len: usize,
     satisfies_order: bool,
+    range: Option<IndexRange<'q>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IndexBound<'q> {
+    value: &'q QueryValue,
+    inclusive: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IndexRange<'q> {
+    lower: Option<IndexBound<'q>>,
+    upper: Option<IndexBound<'q>>,
 }
 
 impl<'a> ResolvedColumn<'a> {
     fn resolve(entry: &SchemaTableEntry, column_name: &'a str) -> Result<Self> {
         let rowid_alias = entry.rowid_alias_column_name()?;
-        if rowid_alias
-            .as_deref()
-            .is_some_and(|alias| alias.eq_ignore_ascii_case(column_name))
-        {
+        if rowid_alias.is_some_and(|alias| alias.eq_ignore_ascii_case(column_name)) {
             return Ok(Self::RowIdAlias);
         }
 
@@ -120,14 +135,25 @@ impl<'a> ResolvedColumn<'a> {
         table_name: &str,
         rowid: u64,
         record: &Record,
+        op: WhereOperator,
         expected: &QueryValue,
+        second: Option<&QueryValue>,
     ) -> Result<bool> {
         let actual = self.decode_value(table_name, rowid, record)?;
-        Ok(match (actual, expected) {
-            (RecordValue::Text(actual), QueryValue::Text(expected)) => actual == expected,
-            (RecordValue::Integer(actual), QueryValue::Integer(expected)) => actual == *expected,
-            _ => false,
-        })
+        let (lower, upper) = SqliteDB::operator_bounds(op, expected, second);
+
+        if let Some(bound) = lower {
+            if !record_satisfies_lower(&actual, bound.value, bound.inclusive) {
+                return Ok(false);
+            }
+        }
+        if let Some(bound) = upper {
+            if !record_satisfies_upper(&actual, bound.value, bound.inclusive) {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     fn decode_sort_value(
@@ -248,7 +274,7 @@ impl SqliteDB {
                                 table_name,
                                 &resolved_columns,
                                 &resolved_order_by,
-                                index_match,
+                                &index_match,
                                 &prefix_values,
                                 &mut seen_rowids,
                                 &mut rows,
@@ -260,7 +286,7 @@ impl SqliteDB {
                                 &resolved_columns,
                                 &resolved_order_by,
                                 &resolved_predicates,
-                                index_match,
+                                &index_match,
                                 &mut seen_rowids,
                                 &mut rows,
                             )?;
@@ -343,7 +369,7 @@ impl SqliteDB {
         resolved_columns: &[ResolvedColumn<'a>],
         resolved_order_by: &[ResolvedOrderBy<'a>],
         predicates: &[ResolvedPredicate<'a>],
-        index_match: IndexMatch<'a>,
+        index_match: &IndexMatch<'_, '_>,
         seen_rowids: &mut HashSet<u64>,
         rows: &mut Vec<MaterializedRow>,
     ) -> Result<()> {
@@ -360,40 +386,51 @@ impl SqliteDB {
         let prefix_values =
             Self::index_prefix_values(index_match.entry, predicates, index_match.prefix_len)?;
 
-        index_scanner.visit_matching_rowids(
-            &index_match.entry.name,
-            index_rootpage,
-            &prefix_values,
-            |rowid| {
-                if seen_rowids.contains(&rowid) {
-                    return Ok(());
-                }
+        let mut handle_rowid = |rowid| {
+            if seen_rowids.contains(&rowid) {
+                return Ok(());
+            }
 
-                table_scanner.with_record_by_rowid(
-                    table_name,
-                    table_rootpage,
-                    rowid,
-                    |rowid, record| {
-                        if !Self::matches_conjunction(table_name, rowid, &record, predicates)? {
-                            return Ok(());
-                        }
-                        if !seen_rowids.insert(rowid) {
-                            return Ok(());
-                        }
+            table_scanner.with_record_by_rowid(
+                table_name,
+                table_rootpage,
+                rowid,
+                |rowid, record| {
+                    if !Self::matches_conjunction(table_name, rowid, &record, predicates)? {
+                        return Ok(());
+                    }
+                    if !seen_rowids.insert(rowid) {
+                        return Ok(());
+                    }
 
-                        rows.push(Self::materialize_row(
-                            table_name,
-                            rowid,
-                            &record,
-                            resolved_columns,
-                            resolved_order_by,
-                        )?);
-                        Ok(())
-                    },
-                )?;
-                Ok(())
-            },
-        )?;
+                    rows.push(Self::materialize_row(
+                        table_name,
+                        rowid,
+                        &record,
+                        resolved_columns,
+                        resolved_order_by,
+                    )?);
+                    Ok(())
+                },
+            )?;
+            Ok(())
+        };
+
+        match (prefix_values.is_empty(), index_match.range) {
+            (true, Some(range)) => index_scanner.visit_range_rowids(
+                &index_match.entry.name,
+                index_rootpage,
+                range.lower.map(|b| (b.value, b.inclusive)),
+                range.upper.map(|b| (b.value, b.inclusive)),
+                &mut handle_rowid,
+            )?,
+            _ => index_scanner.visit_matching_rowids(
+                &index_match.entry.name,
+                index_rootpage,
+                &prefix_values,
+                &mut handle_rowid,
+            )?,
+        }
 
         Ok(())
     }
@@ -440,7 +477,7 @@ impl SqliteDB {
         _table_name: &str,
         resolved_columns: &[ResolvedColumn<'a>],
         resolved_order_by: &[ResolvedOrderBy<'a>],
-        index_match: IndexMatch<'a>,
+        index_match: &IndexMatch<'_, '_>,
         prefix_values: &[QueryValue],
         seen_rowids: &mut HashSet<u64>,
         rows: &mut Vec<MaterializedRow>,
@@ -460,40 +497,51 @@ impl SqliteDB {
         })?;
 
         let index_scanner = IndexScanner::new(self);
-        index_scanner.visit_matching_entries(
-            &index_match.entry.name,
-            index_rootpage,
-            prefix_values,
-            |key_values, rowid| {
-                if !seen_rowids.insert(rowid) {
-                    return Ok(());
-                }
-                let output = resolved_columns
-                    .iter()
-                    .map(|col| {
-                        Self::covering_index_column_output(col, rowid, key_values, indexed_columns)
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .join("|");
-                let sort_keys = resolved_order_by
-                    .iter()
-                    .map(|order| {
-                        Self::covering_index_sort_value(
-                            &order.column,
-                            rowid,
-                            key_values,
-                            indexed_columns,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                rows.push(MaterializedRow {
-                    rowid,
-                    output,
-                    sort_keys,
-                });
-                Ok(())
-            },
-        )?;
+        let mut handle_entry = |key_values: &[RecordValue], rowid: u64| {
+            if !seen_rowids.insert(rowid) {
+                return Ok(());
+            }
+            let output = resolved_columns
+                .iter()
+                .map(|col| {
+                    Self::covering_index_column_output(col, rowid, key_values, indexed_columns)
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join("|");
+            let sort_keys = resolved_order_by
+                .iter()
+                .map(|order| {
+                    Self::covering_index_sort_value(
+                        &order.column,
+                        rowid,
+                        key_values,
+                        indexed_columns,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rows.push(MaterializedRow {
+                rowid,
+                output,
+                sort_keys,
+            });
+            Ok(())
+        };
+
+        match (prefix_values.is_empty(), index_match.range) {
+            (true, Some(range)) => index_scanner.visit_range_entries(
+                &index_match.entry.name,
+                index_rootpage,
+                range.lower.map(|b| (b.value, b.inclusive)),
+                range.upper.map(|b| (b.value, b.inclusive)),
+                &mut handle_entry,
+            )?,
+            _ => index_scanner.visit_matching_entries(
+                &index_match.entry.name,
+                index_rootpage,
+                prefix_values,
+                &mut handle_entry,
+            )?,
+        }
         Ok(())
     }
 
@@ -607,7 +655,9 @@ impl SqliteDB {
             .map(|term| {
                 Ok(ResolvedPredicate {
                     column: ResolvedColumn::resolve(entry, &term.column_name)?,
+                    op: term.op,
                     value: &term.value,
+                    second_value: term.second_value.as_ref(),
                 })
             })
             .collect()
@@ -628,17 +678,18 @@ impl SqliteDB {
             .collect()
     }
 
-    fn choose_best_index<'schema>(
+    fn choose_best_index<'schema, 'q>(
         &'schema self,
         table_name: &str,
-        conjunction: &Conjunction,
+        conjunction: &'q Conjunction,
         order_by: &[ResolvedOrderBy],
-    ) -> Result<Option<IndexMatch<'schema>>> {
-        let mut best_match: Option<IndexMatch<'schema>> = None;
+    ) -> Result<Option<IndexMatch<'schema, 'q>>> {
+        let mut best_match: Option<IndexMatch<'schema, 'q>> = None;
 
         for entry in self.schema_table.indexes_for_table(table_name) {
             let prefix_len = Self::index_prefix_len(entry, conjunction)?;
-            if prefix_len == 0 {
+            let range = Self::index_range_on_first_column(entry, conjunction)?;
+            if prefix_len == 0 && range.is_none() {
                 continue;
             }
 
@@ -646,17 +697,15 @@ impl SqliteDB {
                 entry,
                 prefix_len,
                 satisfies_order: Self::index_satisfies_order(entry, conjunction, order_by)?,
+                range,
             };
 
-            let replace = match best_match {
-                None => true,
-                Some(current) => {
-                    candidate.prefix_len > current.prefix_len
-                        || (candidate.prefix_len == current.prefix_len
-                            && candidate.satisfies_order
-                            && !current.satisfies_order)
-                }
-            };
+            let replace = best_match.is_none_or(|current| {
+                candidate.prefix_len > current.prefix_len
+                    || (candidate.prefix_len == current.prefix_len
+                        && candidate.satisfies_order
+                        && !current.satisfies_order)
+            });
 
             if replace {
                 best_match = Some(candidate);
@@ -674,12 +723,106 @@ impl SqliteDB {
         Ok(indexed_columns
             .iter()
             .take_while(|indexed_column| {
-                conjunction
-                    .terms
-                    .iter()
-                    .any(|term| term.column_name.eq_ignore_ascii_case(indexed_column))
+                conjunction.terms.iter().any(|term| {
+                    term.op == WhereOperator::Eq
+                        && term.column_name.eq_ignore_ascii_case(indexed_column)
+                })
             })
             .count())
+    }
+
+    fn operator_bounds<'q>(
+        op: WhereOperator,
+        value: &'q QueryValue,
+        second: Option<&'q QueryValue>,
+    ) -> (Option<IndexBound<'q>>, Option<IndexBound<'q>>) {
+        match op {
+            WhereOperator::Eq => (
+                Some(IndexBound {
+                    value,
+                    inclusive: true,
+                }),
+                Some(IndexBound {
+                    value,
+                    inclusive: true,
+                }),
+            ),
+            WhereOperator::Gt => (
+                Some(IndexBound {
+                    value,
+                    inclusive: false,
+                }),
+                None,
+            ),
+            WhereOperator::Ge => (
+                Some(IndexBound {
+                    value,
+                    inclusive: true,
+                }),
+                None,
+            ),
+            WhereOperator::Lt => (
+                None,
+                Some(IndexBound {
+                    value,
+                    inclusive: false,
+                }),
+            ),
+            WhereOperator::Le => (
+                None,
+                Some(IndexBound {
+                    value,
+                    inclusive: true,
+                }),
+            ),
+            WhereOperator::Between => match second {
+                Some(high) => (
+                    Some(IndexBound {
+                        value,
+                        inclusive: true,
+                    }),
+                    Some(IndexBound {
+                        value: high,
+                        inclusive: true,
+                    }),
+                ),
+                None => (None, None),
+            },
+        }
+    }
+
+    fn index_range_on_first_column<'q>(
+        entry: &SchemaTableEntry,
+        conjunction: &'q Conjunction,
+    ) -> Result<Option<IndexRange<'q>>> {
+        let Some(indexed_columns) = entry.indexed_column_names()? else {
+            return Ok(None);
+        };
+        let Some(first_indexed) = indexed_columns.first() else {
+            return Ok(None);
+        };
+
+        let mut lower: Option<IndexBound<'q>> = None;
+        let mut upper: Option<IndexBound<'q>> = None;
+
+        for term in &conjunction.terms {
+            if !term.column_name.eq_ignore_ascii_case(first_indexed) {
+                continue;
+            }
+            let (term_lower, term_upper) =
+                SqliteDB::operator_bounds(term.op, &term.value, term.second_value.as_ref());
+            if let Some(bound) = term_lower {
+                lower = Some(bound);
+            }
+            if let Some(bound) = term_upper {
+                upper = Some(bound);
+            }
+        }
+
+        if lower.is_none() && upper.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(IndexRange { lower, upper }))
     }
 
     fn index_satisfies_order(
@@ -758,10 +901,14 @@ impl SqliteDB {
         predicates: &[ResolvedPredicate],
     ) -> Result<bool> {
         for predicate in predicates {
-            if !predicate
-                .column
-                .matches_query_value(table_name, rowid, record, predicate.value)?
-            {
+            if !predicate.column.matches_query_value(
+                table_name,
+                rowid,
+                record,
+                predicate.op,
+                predicate.value,
+                predicate.second_value,
+            )? {
                 return Ok(false);
             }
         }
@@ -1128,14 +1275,18 @@ mod tests {
     fn text_term(column_name: &str, value: &str) -> WhereTerm {
         WhereTerm {
             column_name: column_name.to_owned(),
+            op: WhereOperator::Eq,
             value: QueryValue::Text(value.to_owned()),
+            second_value: None,
         }
     }
 
     fn int_term(column_name: &str, value: i64) -> WhereTerm {
         WhereTerm {
             column_name: column_name.to_owned(),
+            op: WhereOperator::Eq,
             value: QueryValue::Integer(value),
+            second_value: None,
         }
     }
 
@@ -1816,6 +1967,69 @@ mod tests {
         assert!(
             rows.iter().all(|row| row.ends_with("|dominican republic")),
             "all rows must be for dominican republic"
+        );
+    }
+
+    #[test]
+    fn selects_rows_with_between_predicate() {
+        let database = SqliteDB::open(&sample_db_path()).expect("sample db should open");
+
+        let between = WhereTerm {
+            column_name: "id".to_owned(),
+            op: WhereOperator::Between,
+            value: QueryValue::Integer(2),
+            second_value: Some(QueryValue::Integer(3)),
+        };
+
+        let rows = database
+            .select_rows(
+                "apples",
+                &["id".to_owned(), "name".to_owned()],
+                Some(&disjunction(vec![vec![between]])),
+                &[order_by("id", SortDirection::Asc)],
+            )
+            .expect("between rows should parse");
+
+        assert_eq!(rows, vec!["2|Fuji".to_owned(), "3|Honeycrisp".to_owned()]);
+    }
+
+    #[test]
+    fn selects_rows_with_range_predicates_via_index() {
+        let database = SqliteDB::open(&companies_db_path()).expect("companies db should open");
+
+        let rows = database
+            .select_rows(
+                "companies",
+                &["name".to_owned(), "country".to_owned()],
+                Some(&disjunction(vec![vec![WhereTerm {
+                    column_name: "country".to_owned(),
+                    op: WhereOperator::Between,
+                    value: QueryValue::Text("djibouti".to_owned()),
+                    second_value: Some(QueryValue::Text("dominican republic".to_owned())),
+                }]])),
+                &[order_by("country", SortDirection::Asc)],
+            )
+            .expect("between on indexed column should parse");
+
+        assert!(
+            !rows.is_empty(),
+            "should return rows for countries between djibouti and dominican republic"
+        );
+
+        let countries: Vec<&str> = rows
+            .iter()
+            .map(|row| row.rsplit('|').next().unwrap())
+            .collect();
+
+        assert!(
+            countries
+                .iter()
+                .all(|c| *c >= "djibouti" && *c <= "dominican republic"),
+            "all countries must be between djibouti and dominican republic (inclusive)"
+        );
+        assert!(
+            countries.iter().any(|c| *c == "dominican republic"),
+            "result set must include dominican republic to exercise upper-bound inclusivity"
         );
     }
 

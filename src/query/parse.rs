@@ -10,7 +10,8 @@ use sqlparser::parser::{Parser, ParserError};
 use crate::error::SqliteParseError;
 
 use super::statement::{
-    Conjunction, Disjunction, OrderByTerm, QueryValue, SortDirection, SqlStatement, WhereTerm,
+    Conjunction, Disjunction, OrderByTerm, QueryValue, SortDirection, SqlStatement, WhereOperator,
+    WhereTerm,
 };
 
 type ParseResult<T> = std::result::Result<T, QueryBuildError>;
@@ -125,24 +126,53 @@ impl Conjunction {
 
 impl WhereTerm {
     fn parse_expr(expr: &Expr) -> ParseResult<Self> {
-        let Expr::BinaryOp { left, op, right } = strip_nested(expr) else {
-            return Err(QueryBuildError::Unsupported);
-        };
+        match strip_nested(expr) {
+            Expr::BinaryOp { left, op, right } => {
+                let op = match op {
+                    BinaryOperator::Eq => WhereOperator::Eq,
+                    BinaryOperator::Lt => WhereOperator::Lt,
+                    BinaryOperator::LtEq => WhereOperator::Le,
+                    BinaryOperator::Gt => WhereOperator::Gt,
+                    BinaryOperator::GtEq => WhereOperator::Ge,
+                    _ => return Err(QueryBuildError::Unsupported),
+                };
 
-        if *op != BinaryOperator::Eq {
-            return Err(QueryBuildError::Unsupported);
+                let Expr::Identifier(identifier) = strip_nested(left.as_ref()) else {
+                    return Err(QueryBuildError::Unsupported);
+                };
+                let value = QueryValue::parse_expr(strip_nested(right.as_ref()))?;
+
+                Ok(Self {
+                    column_name: identifier.value.clone(),
+                    op,
+                    value,
+                    second_value: None,
+                })
+            }
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => {
+                if *negated {
+                    return Err(QueryBuildError::Unsupported);
+                }
+                let Expr::Identifier(identifier) = strip_nested(expr.as_ref()) else {
+                    return Err(QueryBuildError::Unsupported);
+                };
+                let low = QueryValue::parse_expr(strip_nested(low.as_ref()))?;
+                let high = QueryValue::parse_expr(strip_nested(high.as_ref()))?;
+
+                Ok(Self {
+                    column_name: identifier.value.clone(),
+                    op: WhereOperator::Between,
+                    value: low,
+                    second_value: Some(high),
+                })
+            }
+            _ => Err(QueryBuildError::Unsupported),
         }
-
-        let Expr::Identifier(identifier) = strip_nested(left.as_ref()) else {
-            return Err(QueryBuildError::Unsupported);
-        };
-
-        let value = QueryValue::parse_expr(strip_nested(right.as_ref()))?;
-
-        Ok(Self {
-            column_name: identifier.value.clone(),
-            value,
-        })
     }
 }
 
@@ -484,11 +514,15 @@ mod tests {
                         terms: vec![
                             WhereTerm {
                                 column_name: "color".to_owned(),
+                                op: WhereOperator::Eq,
                                 value: QueryValue::Text("Yellow".to_owned()),
+                                second_value: None,
                             },
                             WhereTerm {
                                 column_name: "id".to_owned(),
+                                op: WhereOperator::Eq,
                                 value: QueryValue::Integer(4),
+                                second_value: None,
                             },
                         ],
                     }],
@@ -513,13 +547,17 @@ mod tests {
                         Conjunction {
                             terms: vec![WhereTerm {
                                 column_name: "color".to_owned(),
+                                op: WhereOperator::Eq,
                                 value: QueryValue::Text("Yellow".to_owned()),
+                                second_value: None,
                             }],
                         },
                         Conjunction {
                             terms: vec![WhereTerm {
                                 column_name: "color".to_owned(),
+                                op: WhereOperator::Eq,
                                 value: QueryValue::Text("Red".to_owned()),
+                                second_value: None,
                             }],
                         },
                     ],
@@ -545,21 +583,79 @@ mod tests {
                             terms: vec![
                                 WhereTerm {
                                     column_name: "color".to_owned(),
+                                    op: WhereOperator::Eq,
                                     value: QueryValue::Text("Yellow".to_owned()),
+                                    second_value: None,
                                 },
                                 WhereTerm {
                                     column_name: "id".to_owned(),
+                                    op: WhereOperator::Eq,
                                     value: QueryValue::Integer(4),
+                                    second_value: None,
                                 },
                             ],
                         },
                         Conjunction {
                             terms: vec![WhereTerm {
                                 column_name: "color".to_owned(),
+                                op: WhereOperator::Eq,
                                 value: QueryValue::Text("Red".to_owned()),
+                                second_value: None,
                             }],
                         },
                     ],
+                }),
+                order_by: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_range_where_operators() {
+        assert_eq!(
+            SqlStatement::parse("SELECT name FROM apples WHERE id >= 2 AND id < 4").unwrap(),
+            SqlStatement::SelectColumns {
+                table_name: "apples".to_owned(),
+                column_names: vec!["name".to_owned()],
+                where_clause: Some(Disjunction {
+                    arms: vec![Conjunction {
+                        terms: vec![
+                            WhereTerm {
+                                column_name: "id".to_owned(),
+                                op: WhereOperator::Ge,
+                                value: QueryValue::Integer(2),
+                                second_value: None,
+                            },
+                            WhereTerm {
+                                column_name: "id".to_owned(),
+                                op: WhereOperator::Lt,
+                                value: QueryValue::Integer(4),
+                                second_value: None,
+                            },
+                        ],
+                    }],
+                }),
+                order_by: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_between_predicate() {
+        assert_eq!(
+            SqlStatement::parse("SELECT name FROM apples WHERE id BETWEEN 2 AND 4").unwrap(),
+            SqlStatement::SelectColumns {
+                table_name: "apples".to_owned(),
+                column_names: vec!["name".to_owned()],
+                where_clause: Some(Disjunction {
+                    arms: vec![Conjunction {
+                        terms: vec![WhereTerm {
+                            column_name: "id".to_owned(),
+                            op: WhereOperator::Between,
+                            value: QueryValue::Integer(2),
+                            second_value: Some(QueryValue::Integer(4)),
+                        }],
+                    }],
                 }),
                 order_by: vec![],
             }

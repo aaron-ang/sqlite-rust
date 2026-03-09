@@ -19,6 +19,9 @@ SELECT id, name, description FROM oranges;
 SELECT name, color FROM apples WHERE color = 'Yellow';
 SELECT name FROM oranges WHERE name = 'Clementine';
 
+-- Range predicate (BETWEEN)
+SELECT id, name FROM apples WHERE id BETWEEN 2 AND 3 ORDER BY id;
+
 
 -- =============================================================================
 -- companies.db (~56k rows, index on country)
@@ -36,6 +39,9 @@ SELECT name, country FROM companies WHERE country = 'dominican republic';
 
 -- Filtered on indexed column with ORDER BY matching index (exercises skip-sort)
 SELECT name, country FROM companies WHERE country = 'dominican republic' ORDER BY country;
+
+-- Range predicate (BETWEEN) on indexed column
+SELECT name, country FROM companies WHERE country BETWEEN 'cambodia' AND 'comoros' ORDER BY country;
 
 -- Filtered on non-indexed column (industry)
 SELECT name, industry FROM companies WHERE industry = 'computer software';
