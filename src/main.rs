@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use std::ffi::OsString;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 
 use clap::Parser;
 use sqlite_rust::{
@@ -79,24 +79,9 @@ fn execute_sql_batch(
 }
 
 fn execute_sql_statement(database: &SqliteDB, statement: &SqlStatement) -> Result<()> {
-    match statement {
-        SqlStatement::SelectCount { table_name } => {
-            println!("{}", database.count_rows(table_name)?);
-        }
-        SqlStatement::SelectColumns {
-            table_name,
-            column_names,
-            where_clause,
-            order_by,
-        } => {
-            println!(
-                "{}",
-                database
-                    .select_rows(table_name, column_names, where_clause.as_ref(), order_by)?
-                    .join("\n")
-            );
-        }
-    }
+    let mut out = BufWriter::new(io::stdout().lock());
+    database.execute(statement, &mut out)?;
+    out.flush()?;
 
     Ok(())
 }

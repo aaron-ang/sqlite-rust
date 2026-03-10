@@ -94,6 +94,56 @@ impl BTreePage {
             .collect()
     }
 
+    pub fn table_leaf_cell_pointer_for_rowid(&self, page: &[u8], target_rowid: u64) -> Option<u16> {
+        self.cell_pointers
+            .binary_search_by(|&ptr| {
+                let rowid = Self::table_leaf_cell_rowid(page, usize::from(ptr)).unwrap_or(0);
+                rowid.cmp(&target_rowid)
+            })
+            .ok()
+            .map(|idx| self.cell_pointers[idx])
+    }
+
+    fn table_leaf_cell_rowid(page: &[u8], cell_offset: usize) -> Result<u64> {
+        let cell = page
+            .get(cell_offset..)
+            .ok_or(SqliteParseError::CellPointerOutOfBounds(cell_offset))?;
+        let mut cursor = CellCursor::new(cell, cell_offset);
+        let _payload_size = cursor.read_varint()?;
+        let rowid = cursor.read_varint()?;
+        Ok(rowid.value())
+    }
+
+    pub fn table_interior_child_for_rowid(&self, page: &[u8], target_rowid: u64) -> Option<u32> {
+        let mut next_page = self.right_most_ptr?;
+
+        let idx = self.cell_pointers.partition_point(|&ptr| {
+            Self::table_interior_cell_key(page, usize::from(ptr))
+                .map(|key| target_rowid > key)
+                .unwrap_or(true)
+        });
+        if idx < self.cell_pointers.len() {
+            let cell_ptr = self.cell_pointers[idx];
+            let left_child_ptr = page
+                .get(usize::from(cell_ptr)..usize::from(cell_ptr) + U32_BYTE_LEN)
+                .map(|mut bytes| bytes.get_u32())
+                .unwrap_or(next_page);
+            next_page = left_child_ptr;
+        }
+
+        Some(next_page)
+    }
+
+    fn table_interior_cell_key(page: &[u8], cell_offset: usize) -> Result<u64> {
+        let cell = page
+            .get(cell_offset..)
+            .ok_or(SqliteParseError::CellPointerOutOfBounds(cell_offset))?;
+        let mut cursor = CellCursor::new(cell, cell_offset);
+        let _left_child_ptr = cursor.read_u32_be()?;
+        let key = cursor.read_varint()?;
+        Ok(key.value())
+    }
+
     pub fn parse_cell<'a>(
         &self,
         page: &'a [u8],

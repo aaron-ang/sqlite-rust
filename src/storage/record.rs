@@ -1,3 +1,4 @@
+use std::fmt::{self, Display, Write};
 use std::str;
 
 use anyhow::{Result, bail};
@@ -75,6 +76,16 @@ pub enum RecordValue<'a> {
     Text(&'a str),
 }
 
+impl Display for RecordValue<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => Ok(()),
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::Text(value) => f.write_str(value),
+        }
+    }
+}
+
 impl<'a> RecordColumn<'a> {
     pub fn value(self) -> &'a [u8] {
         self.value
@@ -115,6 +126,31 @@ impl<'a> RecordColumn<'a> {
                 .decode_optional_integer(column)?
                 .expect("non-null integer serial type should decode to a value");
             return Ok(value.to_string());
+        }
+
+        bail!(SqliteParseError::UnexpectedSerialType {
+            column: column.into(),
+            expected: "text, integer, or null",
+            serial_type: self.serial_type.code(),
+        })
+    }
+
+    pub fn decode_output_to(self, column: impl Into<String>, buf: &mut String) -> Result<()> {
+        if self.serial_type.is_null() {
+            return Ok(());
+        }
+
+        if self.serial_type.is_text() {
+            buf.push_str(self.decode_text(column)?);
+            return Ok(());
+        }
+
+        if self.serial_type.is_integer() {
+            let value = self
+                .decode_optional_integer(column)?
+                .expect("non-null integer serial type should decode to a value");
+            write!(buf, "{value}")?;
+            return Ok(());
         }
 
         bail!(SqliteParseError::UnexpectedSerialType {

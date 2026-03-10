@@ -118,48 +118,38 @@ impl<'a> TableScanner<'a> {
 
             match btree_page.kind {
                 BTreePageKind::TableLeaf => {
-                    for cell in btree_page.cells(&page_bytes, usable_page_size)? {
+                    if let Some(cell_ptr) =
+                        btree_page.table_leaf_cell_pointer_for_rowid(&page_bytes, target_rowid)
+                    {
+                        let cell = btree_page.parse_cell(
+                            &page_bytes,
+                            usize::from(cell_ptr),
+                            usable_page_size,
+                        )?;
                         let BTreeCell::TableLeaf(cell) = cell else {
                             unreachable!("table leaf page should only contain table leaf cells");
                         };
-                        if cell.rowid.value() == target_rowid {
-                            let payload = self.db.read_full_payload(
-                                cell.payload_size.value(),
-                                cell.payload,
-                                cell.overflow_page,
-                            )?;
-                            visitor(target_rowid, Record::parse(payload.as_ref())?)?;
-                            return Ok(true);
-                        }
+                        let payload = self.db.read_full_payload(
+                            cell.payload_size.value(),
+                            cell.payload,
+                            cell.overflow_page,
+                        )?;
+                        visitor(target_rowid, Record::parse(payload.as_ref())?)?;
+                        return Ok(true);
                     }
-
                     return Ok(false);
                 }
                 BTreePageKind::TableInterior => {
-                    let mut next_page = btree_page.right_most_ptr.ok_or(
-                        SqliteParseError::UnsupportedRootPageType {
+                    current_page = btree_page
+                        .table_interior_child_for_rowid(&page_bytes, target_rowid)
+                        .ok_or(SqliteParseError::UnsupportedRootPageType {
                             object_type: "table",
                             object_name: table_name.to_owned(),
                             page_type: page_bytes
                                 .get(btree_page.header_offset)
                                 .copied()
                                 .unwrap_or_default(),
-                        },
-                    )?;
-
-                    for cell in btree_page.cells(&page_bytes, usable_page_size)? {
-                        let BTreeCell::TableInterior(cell) = cell else {
-                            unreachable!(
-                                "table interior page should only contain table interior cells"
-                            );
-                        };
-                        if target_rowid <= cell.key.value() {
-                            next_page = cell.left_child_ptr;
-                            break;
-                        }
-                    }
-
-                    current_page = next_page;
+                        })?;
                 }
                 _ => {
                     let page_type = page_bytes
