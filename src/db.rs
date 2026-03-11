@@ -288,16 +288,14 @@ impl<'a> ResolvedColumn<'a> {
         let actual = self.decode_value(table_name, rowid, record)?;
         let (lower, upper) = SqliteDB::operator_bounds(op, expected, second);
 
-        if let Some(bound) = lower {
-            if !record_satisfies_lower(&actual, bound.value, bound.inclusive) {
+        if let Some(bound) = lower
+            && !record_satisfies_lower(&actual, bound.value, bound.inclusive) {
                 return Ok(false);
             }
-        }
-        if let Some(bound) = upper {
-            if !record_satisfies_upper(&actual, bound.value, bound.inclusive) {
+        if let Some(bound) = upper
+            && !record_satisfies_upper(&actual, bound.value, bound.inclusive) {
                 return Ok(false);
             }
-        }
 
         Ok(true)
     }

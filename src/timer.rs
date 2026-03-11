@@ -1,3 +1,4 @@
+use anyhow::Result;
 use std::io;
 use std::time::Instant;
 
@@ -5,6 +6,11 @@ use std::time::Instant;
 pub struct TimingSnapshot {
     wall_start: Instant,
     usage_start: libc::rusage,
+}
+
+#[derive(Debug)]
+pub struct TimerState {
+    enabled: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -30,6 +36,28 @@ impl TimingSnapshot {
             user_secs: time_diff_secs(usage_end.ru_utime, self.usage_start.ru_utime),
             sys_secs: time_diff_secs(usage_end.ru_stime, self.usage_start.ru_stime),
         })
+    }
+}
+
+impl TimerState {
+    pub fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    pub fn run<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        let timer = self.enabled.then(TimingSnapshot::start).transpose()?;
+        let value = f()?;
+        if let Some(timer) = timer {
+            eprintln!("{}", timer.finish()?.format_sqlite());
+        }
+        Ok(value)
     }
 }
 
@@ -61,6 +89,14 @@ fn time_diff_secs(end: libc::timeval, start: libc::timeval) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_timer_runs_without_timing() {
+        let timer = TimerState::new(false);
+        let value = timer.run(|| Ok::<_, anyhow::Error>(7)).unwrap();
+
+        assert_eq!(value, 7);
+    }
 
     #[test]
     fn formats_sqlite_timer_line() {

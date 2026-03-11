@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Benchmark sqlite3 vs sqlite-rust (50 samples/query, mean). Usage: ./bench/run_benchmarks.sh [root]
+# Benchmark sqlite3 vs sqlite-rust (50 samples/query, mean). Usage: ./benches/run_benchmarks.sh [root]
 
 set -euo pipefail
+
 NUM_SAMPLES=50
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="${1:-$(cd "${SCRIPT_DIR}/.." && pwd)}"

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Compare sqlite3 vs sqlite-rust output for benchmark queries. Usage: ./bench/check_parity.sh [root]
+# Compare sqlite3 vs sqlite-rust output for benchmark queries. Usage: ./benches/check_parity.sh [root]
 
-set -e
+set -euo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="${1:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 SQL_FILE="${SCRIPT_DIR}/benchmark_queries.sql"

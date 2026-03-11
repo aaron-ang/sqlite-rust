@@ -75,3 +75,38 @@ download them by running this script:
 If the script doesn't work for some reason, you can download the databases
 directly from
 [codecrafters-io/sample-sqlite-databases](https://github.com/codecrafters-io/sample-sqlite-databases).
+
+# Benchmark Flamegraphs
+
+Install [`flamegraph`](https://github.com/flamegraph-rs/flamegraph) first:
+
+```sh
+cargo install flamegraph
+```
+
+Then run the aggregate benchmark flamegraph workflow:
+
+```sh
+./benches/run_flamegraphs.sh
+```
+
+This Linux-oriented workflow profiles the real `sqlite-rust` and `sqlite3`
+binaries directly over the aggregate benchmark workload defined in
+`benches/benchmark_queries.sql` and generates two deterministic flamegraphs:
+
+- `benches/artifacts/flamegraphs/sqlite-rust.svg`
+- `benches/artifacts/flamegraphs/sqlite3.svg`
+
+For grouped timing comparisons, use:
+
+```sh
+./benches/run_benchmarks.sh
+```
+
+The script accepts an optional repo root argument and supports these environment
+variables:
+
+```sh
+BENCH_NUM_SAMPLES=10
+BENCH_FLAMEGRAPH_OUT_DIR=benches/artifacts/flamegraphs
+```

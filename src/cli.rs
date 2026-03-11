@@ -1,9 +1,7 @@
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use strum::EnumString;
 
 use crate::error::SqliteParseError;
 use crate::query::SqlStatement;
@@ -22,16 +20,11 @@ pub enum UserInput {
     Sql(Vec<SqlStatement>),
 }
 
-#[derive(Debug, EnumString, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum DotCommand {
-    #[strum(serialize = ".dbinfo")]
     DbInfo,
-    #[strum(serialize = ".tables")]
     Tables,
-}
-
-#[derive(Debug)]
-pub enum ShellCommand {
+    Open(PathBuf),
     Timer(bool),
 }
 
@@ -52,37 +45,58 @@ impl Cli {
 
     pub fn shell_config(&self) -> Result<ShellConfig> {
         let mut config = ShellConfig::default();
-        for command in self.shell_commands()? {
+        for command in self.dot_commands()? {
             match command {
-                ShellCommand::Timer(enabled) => config.timer_enabled = enabled,
+                DotCommand::Timer(enabled) => config.timer_enabled = enabled,
+                _ => bail!(SqliteParseError::UnsupportedShellCommand(
+                    command.to_string()
+                )),
             }
         }
         Ok(config)
     }
 
-    fn shell_commands(&self) -> Result<Vec<ShellCommand>> {
-        self.cmds
-            .iter()
-            .map(|cmd| ShellCommand::parse(cmd))
-            .collect()
+    fn dot_commands(&self) -> Result<Vec<DotCommand>> {
+        self.cmds.iter().map(|cmd| DotCommand::parse(cmd)).collect()
     }
 }
 
 impl UserInput {
     pub fn parse(input: &str) -> Result<Self> {
-        match DotCommand::from_str(input) {
-            Ok(dot_command) => Ok(Self::Dot(dot_command)),
-            Err(_) => Ok(Self::Sql(SqlStatement::parse(input)?)),
+        if input.trim_start().starts_with('.') {
+            Ok(Self::Dot(DotCommand::parse(input)?))
+        } else {
+            Ok(Self::Sql(SqlStatement::parse(input)?))
         }
     }
 }
 
-impl ShellCommand {
+impl DotCommand {
     fn parse(input: &str) -> Result<Self> {
         match input {
+            ".dbinfo" => Ok(Self::DbInfo),
+            ".tables" => Ok(Self::Tables),
             ".timer on" => Ok(Self::Timer(true)),
             ".timer off" => Ok(Self::Timer(false)),
-            _ => bail!(SqliteParseError::UnsupportedShellCommand(input.to_owned())),
+            _ => {
+                if let Some(path) = input.strip_prefix(".open ") {
+                    let path = path.trim();
+                    if !path.is_empty() {
+                        return Ok(Self::Open(PathBuf::from(path)));
+                    }
+                }
+                bail!(SqliteParseError::UnsupportedShellCommand(input.to_owned()))
+            }
+        }
+    }
+
+    fn to_string(&self) -> String {
+        match self {
+            Self::DbInfo => ".dbinfo".to_owned(),
+            Self::Tables => ".tables".to_owned(),
+            Self::Open(path) => format!(".open {}", path.display()),
+            Self::Timer(true) => ".timer on".to_owned(),
+            Self::Timer(false) => ".timer off".to_owned(),
         }
     }
 }
@@ -167,6 +181,31 @@ mod tests {
             UserInput::parse(".tables").unwrap(),
             UserInput::Dot(DotCommand::Tables)
         );
+        assert_eq!(
+            UserInput::parse(".open /tmp/sample.db").unwrap(),
+            UserInput::Dot(DotCommand::Open(PathBuf::from("/tmp/sample.db")))
+        );
+        assert_eq!(
+            UserInput::parse(".timer on").unwrap(),
+            UserInput::Dot(DotCommand::Timer(true))
+        );
+        assert_eq!(
+            UserInput::parse(".timer off").unwrap(),
+            UserInput::Dot(DotCommand::Timer(false))
+        );
+    }
+
+    #[test]
+    fn rejects_open_without_path() {
+        let error = UserInput::parse(".open ").unwrap_err();
+        let error = error
+            .downcast_ref::<SqliteParseError>()
+            .expect("error should downcast to SqliteParseError");
+
+        assert!(matches!(
+            error,
+            SqliteParseError::UnsupportedShellCommand(command) if command == ".open "
+        ));
     }
 
     #[test]
@@ -182,5 +221,20 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn non_timer_cmd_is_rejected_in_cmd_flag() {
+        let cli = Cli::parse_from(["sqlite-rust", "--cmd", ".tables", "sample.db", ".dbinfo"]);
+
+        let error = cli.shell_config().unwrap_err();
+        let error = error
+            .downcast_ref::<SqliteParseError>()
+            .expect("error should downcast to SqliteParseError");
+
+        assert!(matches!(
+            error,
+            SqliteParseError::UnsupportedShellCommand(command) if command == ".tables"
+        ));
     }
 }
